@@ -5,6 +5,7 @@ import logging
 from dotenv import load_dotenv
 from datetime import datetime
 from collections import defaultdict
+from zoneinfo import ZoneInfo
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -13,34 +14,71 @@ from apscheduler.schedulers.background import BackgroundScheduler
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("task-bot")
 
-# CONFIGURATION -----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
 
-REMINDER_CHANNEL_ID = "C0BGU7Z0YHJ"  # hardcoded for now, could be made configurable later
+REMINDER_CHANNEL_ID = "C0XXXXXXX"  # hardcode your channel ID here
 DB_PATH = os.path.join(os.path.dirname(__file__), "tasks.db")
- 
-# --- Reminder schedule -----------------------------------------------------
-# Testing: fire every N minutes. Swap to the cron block below for production
-# (once a day at a fixed time).
-REMINDER_INTERVAL_MINUTES = 1
+
+# set timezone to Eastern Time (handles EST/EDT automatically)
+EST_TZ = ZoneInfo("America/New_York")
+
+
+def now_est():
+    return datetime.now(EST_TZ)
 
 load_dotenv()
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
- 
+
 app = App(token=SLACK_BOT_TOKEN)
- 
+
+# priority ---------------------------------------------------------------------------
+
+VALID_PRIORITIES = {"HIGH", "MEDIUM", "LOW"}
+DEFAULT_PRIORITY = "MEDIUM"
+
+PRIORITY_RANK = {"BACKLOG": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+
+
+def effective_priority(task, today_date):
+    """A task's priority for display/sort purposes: BACKLOG if its due date
+    has passed, otherwise whatever priority was set on it."""
+    due = datetime.strptime(task["due_date"], "%Y-%m-%d").date()
+    if due < today_date:
+        return "BACKLOG"
+    return task["priority"]
+
+# non-working hours ----------------------------------------------------------------------
+
+NON_WORKING_START_HOUR = 21  # 9pm EST — reminders stop at/after this hour
+NON_WORKING_END_HOUR = 9     # 9am EST — reminders resume at/after this hour
+
+
+def is_working_hours(now_dt):
+    hour = now_dt.hour
+    if NON_WORKING_START_HOUR > NON_WORKING_END_HOUR:
+        # window wraps past midnight, e.g. 9pm -> 9am.
+        return not (hour >= NON_WORKING_START_HOUR or hour < NON_WORKING_END_HOUR)
+    return not (NON_WORKING_START_HOUR <= hour < NON_WORKING_END_HOUR)
+
+# command parsing --------------------------------------------------------------------
+
 MENTION_RE = re.compile(
     r'^\s*(?:<@(?P<user_id>\w+)(?:\|[^>]*)?>|@(?P<username>[A-Za-z0-9_.\-]+))\s+'
 )
 REST_RE = re.compile(
     r'^["\u201c](?P<description>[^"\u201d]+)["\u201d]\s+'
-    r'(?P<due_date>\d{4}-\d{2}-\d{2})\s+(?P<due_time>\d{2}:\d{2})\s*$'
+    r'(?P<due_date>\d{4}-\d{2}-\d{2})'
+    r'(?:\s+(?P<priority>HIGH|MEDIUM|LOW))?\s*$',
+    re.IGNORECASE,
 )
- 
+
 _user_cache = {"by_username": {}, "fetched_at": None}
- 
- 
+
+
 def _refresh_user_cache():
     by_username = {}
     cursor = None
@@ -63,33 +101,31 @@ def _refresh_user_cache():
             break
     _user_cache["by_username"] = by_username
     _user_cache["fetched_at"] = datetime.now()
- 
- 
+
+
 def resolve_username(username, force_refresh=False):
     """Look up a Slack user ID from a plain @username. Refreshes cache on miss."""
     key = username.strip().lstrip("@").lower()
- 
+
     if not _user_cache["by_username"] or force_refresh:
         _refresh_user_cache()
- 
+
     user_id = _user_cache["by_username"].get(key)
     if user_id is None:
         # Cache may be stale (new member, renamed handle) — refresh once and retry.
         _refresh_user_cache()
         user_id = _user_cache["by_username"].get(key)
- 
+
     return user_id
- 
-# ---------------------------------------------------------------------------
-# DB
-# ---------------------------------------------------------------------------
- 
+
+# DB ---------------------------------------------------------------------------
+
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
- 
- 
+
+
 def init_db():
     conn = get_conn()
     conn.execute(
@@ -98,29 +134,30 @@ def init_db():
             task_id INTEGER PRIMARY KEY AUTOINCREMENT,
             description TEXT NOT NULL,
             assignee_id TEXT NOT NULL,
-            due_date TEXT NOT NULL,      -- ISO 'YYYY-MM-DD HH:MM'
-            status TEXT NOT NULL DEFAULT 'open',  -- open | done
+            due_date TEXT NOT NULL,      -- 'YYYY-MM-DD', Eastern Time
+            status TEXT NOT NULL DEFAULT 'open',      -- open | done
+            priority TEXT NOT NULL DEFAULT 'MEDIUM',  -- HIGH | MEDIUM | LOW
             created_by TEXT NOT NULL
         )
         """
     )
     conn.commit()
     conn.close()
- 
- 
-def add_task(description, assignee_id, due_date, created_by):
+
+
+def add_task(description, assignee_id, due_date, priority, created_by):
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO tasks (description, assignee_id, due_date, status, created_by) "
-        "VALUES (?, ?, ?, 'open', ?)",
-        (description, assignee_id, due_date, created_by),
+        "INSERT INTO tasks (description, assignee_id, due_date, status, priority, created_by) "
+        "VALUES (?, ?, ?, 'open', ?, ?)",
+        (description, assignee_id, due_date, priority, created_by),
     )
     conn.commit()
     task_id = cur.lastrowid
     conn.close()
     return task_id
- 
- 
+
+
 def get_open_tasks():
     conn = get_conn()
     rows = conn.execute(
@@ -128,15 +165,15 @@ def get_open_tasks():
     ).fetchall()
     conn.close()
     return rows
- 
- 
+
+
 def get_task(task_id):
     conn = get_conn()
     row = conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
     conn.close()
     return row
- 
- 
+
+
 def mark_done(task_id):
     conn = get_conn()
     cur = conn.execute(
@@ -147,36 +184,33 @@ def mark_done(task_id):
     updated = cur.rowcount
     conn.close()
     return updated > 0
- 
- 
-# ---------------------------------------------------------------------------
-# Slash commands
-# ---------------------------------------------------------------------------
- 
+
+# slash commands ---------------------------------------------------------------------------
+
 @app.command("/addtask")
 def handle_task(ack, respond, command):
     ack()
     text = command.get("text", "")
- 
+
     mention_match = MENTION_RE.match(text)
     if not mention_match:
         respond(
             'Couldn\'t find a person at the start. Format: '
-            '`/addtask @person "description" YYYY-MM-DD HH:MM`\n'
+            '`/addtask @person "description" YYYY-MM-DD [HIGH|MEDIUM|LOW]`\n'
             f"Here's exactly what I received:\n```{text!r}```"
         )
         return
- 
+
     rest = text[mention_match.end():]
     rest_match = REST_RE.match(rest)
     if not rest_match:
         respond(
             'Got the person, but couldn\'t parse the rest. Format: '
-            '`/addtask @person "description" YYYY-MM-DD HH:MM`\n'
+            '`/addtask @person "description" YYYY-MM-DD [HIGH|MEDIUM|LOW]`\n'
             f"Here's exactly what I received:\n```{text!r}```"
         )
         return
- 
+
     if mention_match.group("user_id"):
         assignee_id = mention_match.group("user_id")
     else:
@@ -189,49 +223,53 @@ def handle_task(ack, respond, command):
                 "mention dropdown again."
             )
             return
- 
+
     description = rest_match.group("description").strip()
-    due_date = f'{rest_match.group("due_date")} {rest_match.group("due_time")}'
- 
+    due_date = rest_match.group("due_date")
+
     try:
-        datetime.strptime(due_date, "%Y-%m-%d %H:%M")
+        datetime.strptime(due_date, "%Y-%m-%d")
     except ValueError:
-        respond("That date/time doesn't look valid. Use YYYY-MM-DD HH:MM.")
+        respond("That date doesn't look valid. Use YYYY-MM-DD (Eastern Time).")
         return
- 
+
+    priority_input = rest_match.group("priority")
+    priority = priority_input.upper() if priority_input else DEFAULT_PRIORITY
+
     created_by = command["user_id"]
-    task_id = add_task(description, assignee_id, due_date, created_by)
- 
+    task_id = add_task(description, assignee_id, due_date, priority, created_by)
+
     respond(
-        f"Task #{task_id} created for <@{assignee_id}>: \"{description}\" — due {due_date}"
+        f'Task #{task_id} created for <@{assignee_id}>: "{description}" — '
+        f"due {due_date} (ET), priority {priority}"
     )
- 
- 
+
+
 @app.command("/done")
 def handle_done(ack, respond, command):
     ack()
     text = command.get("text", "").strip()
- 
+
     if not text.isdigit():
         respond("Usage: `/done <task_id>`")
         return
- 
+
     task_id = int(text)
     task = get_task(task_id)
- 
+
     if task is None:
         respond(f"No task #{task_id} found.")
         return
- 
+
     if task["status"] == "done":
         respond(f"Task #{task_id} is already marked done.")
         return
- 
+
     mark_done(task_id)
- 
+
     respond(f'Task #{task_id} ("{task["description"]}") marked done.')
- 
-    # Confirm to the assignee (if the caller wasn't the assignee) and the creator.
+
+    # confirm to the assignee (if the caller wasn't the assignee) and the creator.
     notify_ids = {task["assignee_id"], task["created_by"]}
     notify_ids.discard(command["user_id"])
     for user_id in notify_ids:
@@ -242,17 +280,23 @@ def handle_done(ack, respond, command):
             )
         except Exception:
             logger.exception("Failed to DM %s about task #%s", user_id, task_id)
- 
- 
-# ---------------------------------------------------------------------------
-# Daily reminder job
-# ---------------------------------------------------------------------------
- 
-def build_reminder_blocks(tasks_by_assignee):
+
+# hourly reminders ---------------------------------------------------------------------------
+
+def build_reminder_blocks(tasks_by_assignee, today_date):
     blocks = []
     for assignee_id, tasks in tasks_by_assignee.items():
+        tasks_sorted = sorted(
+            tasks,
+            key=lambda t: (
+                PRIORITY_RANK[effective_priority(t, today_date)],
+                t["due_date"],
+            ),
+        )
         lines = [
-            f'• #{t["task_id"]} {t["description"]} — due {t["due_date"]}' for t in tasks
+            f'• [{effective_priority(t, today_date)}] #{t["task_id"]} '
+            f'{t["description"]} — due {t["due_date"]}'
+            for t in tasks_sorted
         ]
         blocks.append(
             {
@@ -264,66 +308,58 @@ def build_reminder_blocks(tasks_by_assignee):
             }
         )
     return blocks
- 
- 
-def send_daily_reminders():
+
+
+def send_hourly_reminders():
+    now = now_est()
+
+    if not is_working_hours(now):
+        logger.info("Outside working hours (EST), skipping reminder.")
+        return
+
     tasks = get_open_tasks()
- 
+
     if not tasks:
         logger.info("No open tasks, skipping reminder post.")
         return
- 
+
     grouped = defaultdict(list)
     for t in tasks:
         grouped[t["assignee_id"]].append(t)
- 
-    blocks = build_reminder_blocks(grouped)
- 
+
+    blocks = build_reminder_blocks(grouped, now.date())
+
     try:
         app.client.chat_postMessage(
             channel=REMINDER_CHANNEL_ID,
-            text="Daily task reminders",  # fallback text for notifications
+            text="Hourly task reminders",  # fallback text for notifications
             blocks=blocks,
         )
         logger.info("Posted reminders for %d assignee(s).", len(grouped))
     except Exception:
-        logger.exception("Failed to post daily reminders.")
- 
- 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
- 
+        logger.exception("Failed to post hourly reminders.")
+
+# entry point ---------------------------------------------------------------------------
+
 def main():
     init_db()
- 
-    scheduler = BackgroundScheduler()
- 
-    # TESTING (current): fire every REMINDER_INTERVAL_MINUTES minutes.
+
+    scheduler = BackgroundScheduler(timezone=EST_TZ)
+
+    # fires every hour on the hour, in Eastern Time (handles EST/EDT).
     scheduler.add_job(
-        send_daily_reminders,
-        trigger="interval",
-        minutes=REMINDER_INTERVAL_MINUTES,
-        id="daily_reminder",
+        send_hourly_reminders,
+        trigger="cron",
+        minute=0,
+        id="hourly_reminder",
     )
- 
-    # PRODUCTION: once a day at a fixed time. Comment out the interval block
-    # above and uncomment this instead:
-    #
-    # scheduler.add_job(
-    #     send_daily_reminders,
-    #     trigger="cron",
-    #     hour=9,      # 24h, local server time
-    #     minute=0,
-    #     id="daily_reminder",
-    # )
- 
+
     scheduler.start()
- 
+
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     logger.info("Bot starting (Socket Mode)...")
     handler.start()
- 
- 
+
+
 if __name__ == "__main__":
     main()
