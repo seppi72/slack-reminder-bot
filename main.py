@@ -18,7 +18,7 @@ logger = logging.getLogger("task-bot")
 # config
 # ---------------------------------------------------------------------------
 
-REMINDER_CHANNEL_ID = "C0XXXXXXX"  # hardcode your channel ID here
+REMINDER_CHANNEL_ID = "C0BGU7Z0YHJ"  # hardcoded channel ID
 DB_PATH = os.path.join(os.path.dirname(__file__), "tasks.db")
 
 # set timezone to Eastern Time (handles EST/EDT automatically)
