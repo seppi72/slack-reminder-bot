@@ -3,7 +3,7 @@ import re
 import sqlite3
 import logging
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 from zoneinfo import ZoneInfo
 
@@ -19,8 +19,8 @@ logger = logging.getLogger("task-bot")
 # config
 # ---------------------------------------------------------------------------
 
-REMINDER_CHANNEL_ID = "C0BJTQ09GFL"  # hardcoded channel ID — no longer used for reminders,
-                                     # kept around in case you want an admin/log channel later
+REMINDER_CHANNEL_ID = "C0BJTQ09GFL"  # hardcoded channel ID — no longer used for reminders, but might be useful to keep around
+
 DB_PATH = os.path.join(os.path.dirname(__file__), "tasks.db")
 
 # fixed team leaders who get added to every per-person registration channel.
@@ -150,7 +150,8 @@ def init_db():
             due_date TEXT NOT NULL,      -- 'YYYY-MM-DD', Eastern Time
             status TEXT NOT NULL DEFAULT 'open',      -- open | done
             priority TEXT NOT NULL DEFAULT 'MEDIUM',  -- HIGH | MEDIUM | LOW
-            created_by TEXT NOT NULL
+            created_by TEXT NOT NULL,
+            completed_at TEXT              -- ISO timestamp (Eastern Time), set when marked done
         )
         """
     )
@@ -168,6 +169,18 @@ def init_db():
     )
     conn.commit()
     conn.close()
+    _migrate_columns()
+
+
+def _migrate_columns():
+    """Add columns to tasks that didn't exist when the table was first created,
+    so a production DB from before this change doesn't break on the next deploy."""
+    conn = get_conn()
+    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    if "completed_at" not in existing_cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN completed_at TEXT")
+    conn.commit()
+    conn.close()
 
 
 def get_registration_by_assignee(assignee_id):
@@ -177,6 +190,13 @@ def get_registration_by_assignee(assignee_id):
     ).fetchone()
     conn.close()
     return row
+
+
+def get_all_registrations():
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM registrations").fetchall()
+    conn.close()
+    return rows
 
 
 def add_registration(assignee_id, channel_id, channel_name, email, registered_by):
@@ -222,13 +242,27 @@ def get_task(task_id):
 def mark_done(task_id):
     conn = get_conn()
     cur = conn.execute(
-        "UPDATE tasks SET status = 'done' WHERE task_id = ? AND status = 'open'",
-        (task_id,),
+        "UPDATE tasks SET status = 'done', completed_at = ? WHERE task_id = ? AND status = 'open'",
+        (now_est().isoformat(), task_id),
     )
     conn.commit()
     updated = cur.rowcount
     conn.close()
     return updated > 0
+
+
+def get_tasks_for_weekly_report(week_start_iso):
+    """Every task relevant to this week's report: still-open tasks (regardless of when
+    created) plus tasks completed since week_start_iso."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE status = 'open' "
+        "OR (status = 'done' AND completed_at >= ?) "
+        "ORDER BY assignee_id, due_date ASC",
+        (week_start_iso,),
+    ).fetchall()
+    conn.close()
+    return rows
 
 # slash commands ---------------------------------------------------------------------------
 
@@ -477,10 +511,21 @@ def send_hourly_reminders():
 
         block = build_assignee_block(assignee_id, assignee_tasks, now.date())
 
+        # Slack notification previews (mobile push, desktop banner, sidebar unread)
+        # are driven by this top-level "text", not by the blocks, so it needs to
+        # actually name the tasks, not just say "reminders".
+        count = len(assignee_tasks)
+        overdue_count = sum(
+            1 for t in assignee_tasks if effective_priority(t, now.date()) == "BACKLOG"
+        )
+        summary = f"You have {count} open task{'s' if count != 1 else ''}"
+        if overdue_count:
+            summary += f", {overdue_count} overdue"
+
         try:
             app.client.chat_postMessage(
                 channel=registration["channel_id"],
-                text="Task reminders",  # fallback text for notifications
+                text=summary,
                 blocks=[block],
             )
             posted += 1
@@ -499,6 +544,84 @@ def send_hourly_reminders():
 
     logger.info("Posted reminders to %d registered channel(s).", posted)
 
+# weekly report ---------------------------------------------------------------------------
+
+def build_weekly_report_text(assignee_tasks, week_start_date, today_date):
+    """Plain-text report body. Deliberately no <@user> mentions — this posts into
+    the person's own private channel, so there's nothing to tag."""
+    done = [t for t in assignee_tasks if t["status"] == "done"]
+    open_tasks = [t for t in assignee_tasks if t["status"] == "open"]
+    backlog = [t for t in open_tasks if effective_priority(t, today_date) == "BACKLOG"]
+    todo = [t for t in open_tasks if effective_priority(t, today_date) != "BACKLOG"]
+
+    lines = [
+        f"*Weekly Report — {week_start_date.strftime('%b %d')} to {today_date.strftime('%b %d')}*"
+    ]
+
+    lines.append(f"\n✅ *Completed this week ({len(done)})*")
+    if done:
+        for t in sorted(done, key=lambda t: t["completed_at"] or ""):
+            done_date = t["completed_at"][:10] if t["completed_at"] else "unknown date"
+            lines.append(f'• #{t["task_id"]} {t["description"]} (done {done_date})')
+    else:
+        lines.append("_none_")
+
+    lines.append(f"\n⏳ *Backlog / overdue ({len(backlog)})*")
+    if backlog:
+        for t in sorted(backlog, key=lambda t: t["due_date"]):
+            lines.append(f'• #{t["task_id"]} {t["description"]} — was due {t["due_date"]}')
+    else:
+        lines.append("_none_")
+
+    lines.append(f"\n📌 *To do ({len(todo)})*")
+    if todo:
+        for t in sorted(todo, key=lambda t: (PRIORITY_RANK[t["priority"]], t["due_date"])):
+            lines.append(
+                f'• [{t["priority"]}] #{t["task_id"]} {t["description"]} — due {t["due_date"]}'
+            )
+    else:
+        lines.append("_none_")
+
+    return "\n".join(lines)
+
+
+def send_weekly_reports():
+    now = now_est()
+    week_start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=now.weekday())
+    week_start_iso = week_start.isoformat()
+
+    tasks = get_tasks_for_weekly_report(week_start_iso)
+    grouped = defaultdict(list)
+    for t in tasks:
+        grouped[t["assignee_id"]].append(t)
+
+    registrations = get_all_registrations()
+    if not registrations:
+        logger.info("No registered members, skipping weekly report.")
+        return
+
+    sent, failed = 0, []
+
+    for reg in registrations:
+        assignee_id = reg["assignee_id"]
+        assignee_tasks = grouped.get(assignee_id, [])
+        report_text = build_weekly_report_text(assignee_tasks, week_start.date(), now.date())
+
+        try:
+            app.client.chat_postMessage(
+                channel=reg["channel_id"],
+                text=f"Weekly report — {now.strftime('%b %d')}",
+                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": report_text}}],
+            )
+            sent += 1
+        except Exception:
+            logger.exception("Failed to post weekly report to channel %s", reg["channel_id"])
+            failed.append(assignee_id)
+
+    logger.info("Weekly report sent to %d channel(s).", sent)
+    if failed:
+        logger.warning("Weekly report failed for assignee(s): %s", ", ".join(failed))
+
 # entry point ---------------------------------------------------------------------------
 
 def main():
@@ -506,12 +629,22 @@ def main():
 
     scheduler = BackgroundScheduler(timezone=EST_TZ)
 
-    # fires every hour on the hour, in Eastern Time (handles EST/EDT).
+    # fires every hour on the hour, in EST/EDT
     scheduler.add_job(
         send_hourly_reminders,
         trigger="cron",
         minute=0,
         id="hourly_reminder",
+    )
+
+    # fires Fridays at 6pm, in EST/EDT
+    scheduler.add_job(
+        send_weekly_reports,
+        trigger="cron",
+        day_of_week="fri",
+        hour=18,
+        minute=0,
+        id="weekly_report",
     )
 
     scheduler.start()
