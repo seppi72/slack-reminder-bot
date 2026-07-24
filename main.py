@@ -19,11 +19,10 @@ logger = logging.getLogger("task-bot")
 # config
 # ---------------------------------------------------------------------------
 
-REMINDER_CHANNEL_ID = "C0BJTQ09GFL"  # hardcoded channel ID — no longer used for reminders, but might be useful to keep around
-
+REMINDER_CHANNEL_ID = "C0BJTQ09GFL"  # hardcoded channel ID — no longer used for reminders, but kept just in case
 DB_PATH = os.path.join(os.path.dirname(__file__), "tasks.db")
 
-# fixed team leaders who get added to every per-person registration channel.
+# fixed team leaders who get added to every per-person registration channel
 TEAM_LEADER_IDS = [
     "U0B6L4YQ734",
     "U09453J1QBW",
@@ -84,10 +83,22 @@ REST_RE = re.compile(
     re.IGNORECASE,
 )
 
-REGISTER_RE = re.compile(r'^\s*(?P<email>\S+)\s+(?P<channel_name>\S+)\s*$')
+REGISTER_RE = re.compile(r'^\s*(?P<identifier>\S+)\s+(?P<channel_name>\S+)\s*$')
 EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+# The first token of /register — either a mention (linked, piped, or plain @username)
+# or an email. All three mention formats contain no whitespace, so this matches as a
+# single token the same way REGISTER_RE's identifier group expects.
+PERSON_TOKEN_RE = re.compile(
+    r'^(?:<@(?P<user_id>\w+)(?:\|[^>]*)?>|@(?P<username>[A-Za-z0-9_.\-]+)'
+    r'|(?P<email>[^@\s]+@[^@\s]+\.[^@\s]+))$'
+)
 # Slack channel name rules: lowercase, no spaces/periods, letters/numbers/hyphens/underscores, max 80 chars.
 CHANNEL_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9_-]{0,79}$')
+# /unregister takes just a single person reference — either a mention or an email —
+# with nothing else after it, so this is a standalone version of MENTION_RE.
+UNREGISTER_MENTION_RE = re.compile(
+    r'^\s*(?:<@(?P<user_id>\w+)(?:\|[^>]*)?>|@(?P<username>[A-Za-z0-9_.\-]+))\s*$'
+)
 
 _user_cache = {"by_username": {}, "fetched_at": None}
 
@@ -208,6 +219,15 @@ def add_registration(assignee_id, channel_id, channel_name, email, registered_by
     )
     conn.commit()
     conn.close()
+
+
+def delete_registration(assignee_id):
+    conn = get_conn()
+    cur = conn.execute("DELETE FROM registrations WHERE assignee_id = ?", (assignee_id,))
+    conn.commit()
+    deleted = cur.rowcount
+    conn.close()
+    return deleted > 0
 
 
 def add_task(description, assignee_id, due_date, priority, created_by):
@@ -332,17 +352,14 @@ def handle_register(ack, respond, command):
     match = REGISTER_RE.match(text)
     if not match:
         respond(
-            "Usage: `/register email@company.com channel-name`\n"
+            "Usage: `/register @person channel-name` or `/register email@company.com channel-name`\n"
+            "Example: `/register @giuseppe giuseppe-automations`\n"
             "Example: `/register nicolas@company.com nicolas-ecommerce`"
         )
         return
 
-    email = match.group("email").strip()
+    identifier = match.group("identifier").strip()
     channel_name = match.group("channel_name").strip().lower()
-
-    if not EMAIL_RE.match(email):
-        respond(f"`{email}` doesn't look like a valid email address.")
-        return
 
     if not CHANNEL_NAME_RE.match(channel_name):
         respond(
@@ -351,19 +368,41 @@ def handle_register(ack, respond, command):
         )
         return
 
-    # look up the Slack member by email
-    try:
-        lookup = app.client.users_lookupByEmail(email=email)
-    except SlackApiError as e:
-        error_code = e.response.get("error") if e.response else str(e)
-        if error_code == "users_not_found":
-            respond(f"No Slack member found with email `{email}`.")
-        else:
-            logger.exception("users_lookupByEmail failed for %s", email)
-            respond(f"Slack API error looking up `{email}`: `{error_code}`")
+    person_match = PERSON_TOKEN_RE.match(identifier)
+    if not person_match:
+        respond(
+            f"Couldn't parse `{identifier}` as a person. Use a mention (`@person`, selected "
+            "from the dropdown) or a valid email address."
+        )
         return
 
-    assignee_id = lookup["user"]["id"]
+    email = None  # only set if registration was done via email lookup
+
+    if person_match.group("user_id"):
+        assignee_id = person_match.group("user_id")
+    elif person_match.group("username"):
+        username = person_match.group("username")
+        assignee_id = resolve_username(username)
+        if assignee_id is None:
+            respond(
+                f"Couldn't find a Slack member matching `@{username}`. "
+                "Double check the spelling, or try selecting them from the "
+                "mention dropdown again."
+            )
+            return
+    else:
+        email = person_match.group("email")
+        try:
+            lookup = app.client.users_lookupByEmail(email=email)
+        except SlackApiError as e:
+            error_code = e.response.get("error") if e.response else str(e)
+            if error_code == "users_not_found":
+                respond(f"No Slack member found with email `{email}`.")
+            else:
+                logger.exception("users_lookupByEmail failed for %s", email)
+                respond(f"Slack API error looking up `{email}`: `{error_code}`")
+            return
+        assignee_id = lookup["user"]["id"]
 
     # already registered? don't create a duplicate channel.
     existing = get_registration_by_assignee(assignee_id)
@@ -422,6 +461,92 @@ def handle_register(ack, respond, command):
         logger.exception("Failed to post welcome message to channel %s", channel_id)
 
     respond(f"Registered <@{assignee_id}> — created <#{channel_id}> (`{channel_name}`).")
+
+
+@app.command("/unregister")
+def handle_unregister(ack, respond, command):
+    ack()
+    text = command.get("text", "").strip()
+
+    if not text:
+        respond("Usage: `/unregister @person` or `/unregister email@company.com`")
+        return
+
+    assignee_id = None
+
+    mention_match = UNREGISTER_MENTION_RE.match(text)
+    if mention_match:
+        if mention_match.group("user_id"):
+            assignee_id = mention_match.group("user_id")
+        else:
+            username = mention_match.group("username")
+            assignee_id = resolve_username(username)
+            if assignee_id is None:
+                respond(
+                    f"Couldn't find a Slack member matching `@{username}`. "
+                    "Double check the spelling, or try selecting them from the "
+                    "mention dropdown again."
+                )
+                return
+    elif EMAIL_RE.match(text):
+        try:
+            lookup = app.client.users_lookupByEmail(email=text)
+        except SlackApiError as e:
+            error_code = e.response.get("error") if e.response else str(e)
+            if error_code == "users_not_found":
+                respond(f"No Slack member found with email `{text}`.")
+            else:
+                logger.exception("users_lookupByEmail failed for %s", text)
+                respond(f"Slack API error looking up `{text}`: `{error_code}`")
+            return
+        assignee_id = lookup["user"]["id"]
+    else:
+        respond(
+            "Couldn't parse that. Usage: `/unregister @person` or "
+            "`/unregister email@company.com`"
+        )
+        return
+
+    registration = get_registration_by_assignee(assignee_id)
+    if registration is None:
+        respond(f"<@{assignee_id}> isn't registered — nothing to do.")
+        return
+
+    channel_id = registration["channel_id"]
+    channel_name = registration["channel_name"]
+
+    # Slack's API has no true "delete channel" endpoint — conversations.archive is
+    # the closest equivalent (hides it, blocks new messages, can be un-archived by
+    # an admin later if needed). Let the member know why the channel is going away
+    # before archiving, best-effort.
+    try:
+        app.client.chat_postMessage(
+            channel=channel_id,
+            text=f"This channel (`{channel_name}`) is being unregistered and archived.",
+        )
+    except Exception:
+        logger.exception("Failed to post unregister notice to channel %s", channel_id)
+
+    archive_status = "archived"
+    try:
+        app.client.conversations_archive(channel=channel_id)
+    except SlackApiError as e:
+        error_code = e.response.get("error") if e.response else str(e)
+        if error_code == "already_archived":
+            archive_status = "was already archived"
+        elif error_code == "channel_not_found":
+            archive_status = "channel no longer exists (already deleted/archived elsewhere)"
+        else:
+            logger.exception("conversations_archive failed for channel %s", channel_id)
+            archive_status = f"FAILED to archive (`{error_code}`) — you may need to archive it manually"
+
+    delete_registration(assignee_id)
+
+    respond(
+        f"Unregistered <@{assignee_id}>. Channel `{channel_name}` (<#{channel_id}>): {archive_status}. "
+        "Their registration mapping has been removed either way — any of their open tasks "
+        "will now be skipped by reminders/reports until they're registered again."
+    )
 
 
 @app.command("/done")
@@ -512,7 +637,7 @@ def send_hourly_reminders():
         block = build_assignee_block(assignee_id, assignee_tasks, now.date())
 
         # Slack notification previews (mobile push, desktop banner, sidebar unread)
-        # are driven by this top-level "text", not by the blocks, so it needs to
+        # are driven by this top-level "text", not by the blocks — so it needs to
         # actually name the tasks, not just say "reminders".
         count = len(assignee_tasks)
         overdue_count = sum(
@@ -637,7 +762,7 @@ def main():
         id="hourly_reminder",
     )
 
-    # fires Fridays at 6pm, in EST/EDT
+    # fires on fridays at 6pm, in EST/EDT
     scheduler.add_job(
         send_weekly_reports,
         trigger="cron",
