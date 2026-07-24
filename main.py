@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_sdk.errors import SlackApiError
 from apscheduler.schedulers.background import BackgroundScheduler
 
 logging.basicConfig(level=logging.INFO)
@@ -18,8 +19,15 @@ logger = logging.getLogger("task-bot")
 # config
 # ---------------------------------------------------------------------------
 
-REMINDER_CHANNEL_ID = "C0BJTQ09GFL"  # hardcoded channel ID
+REMINDER_CHANNEL_ID = "C0BJTQ09GFL"  # hardcoded channel ID — no longer used for reminders,
+                                     # kept around in case you want an admin/log channel later
 DB_PATH = os.path.join(os.path.dirname(__file__), "tasks.db")
+
+# fixed team leaders who get added to every per-person registration channel.
+TEAM_LEADER_IDS = [
+    "U0B6L4YQ734",
+    "U09453J1QBW",
+]
 
 # set timezone to Eastern Time (handles EST/EDT automatically)
 EST_TZ = ZoneInfo("America/New_York")
@@ -75,6 +83,11 @@ REST_RE = re.compile(
     r'(?:\s+(?P<priority>HIGH|MEDIUM|LOW))?\s*$',
     re.IGNORECASE,
 )
+
+REGISTER_RE = re.compile(r'^\s*(?P<email>\S+)\s+(?P<channel_name>\S+)\s*$')
+EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+# Slack channel name rules: lowercase, no spaces/periods, letters/numbers/hyphens/underscores, max 80 chars.
+CHANNEL_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9_-]{0,79}$')
 
 _user_cache = {"by_username": {}, "fetched_at": None}
 
@@ -140,6 +153,38 @@ def init_db():
             created_by TEXT NOT NULL
         )
         """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS registrations (
+            assignee_id TEXT PRIMARY KEY,   -- the team member this channel is for
+            channel_id TEXT NOT NULL,
+            channel_name TEXT NOT NULL,
+            email TEXT,
+            registered_by TEXT NOT NULL,
+            registered_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_registration_by_assignee(assignee_id):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM registrations WHERE assignee_id = ?", (assignee_id,)
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def add_registration(assignee_id, channel_id, channel_name, email, registered_by):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO registrations (assignee_id, channel_id, channel_name, email, "
+        "registered_by, registered_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (assignee_id, channel_id, channel_name, email, registered_by, now_est().isoformat()),
     )
     conn.commit()
     conn.close()
@@ -245,6 +290,106 @@ def handle_task(ack, respond, command):
     )
 
 
+@app.command("/register")
+def handle_register(ack, respond, command):
+    ack()
+    text = command.get("text", "").strip()
+
+    match = REGISTER_RE.match(text)
+    if not match:
+        respond(
+            "Usage: `/register email@company.com channel-name`\n"
+            "Example: `/register nicolas@company.com nicolas-ecommerce`"
+        )
+        return
+
+    email = match.group("email").strip()
+    channel_name = match.group("channel_name").strip().lower()
+
+    if not EMAIL_RE.match(email):
+        respond(f"`{email}` doesn't look like a valid email address.")
+        return
+
+    if not CHANNEL_NAME_RE.match(channel_name):
+        respond(
+            f"`{channel_name}` isn't a valid channel name. Use lowercase letters, "
+            "numbers, hyphens, or underscores only (no spaces or periods), max 80 characters."
+        )
+        return
+
+    # look up the Slack member by email
+    try:
+        lookup = app.client.users_lookupByEmail(email=email)
+    except SlackApiError as e:
+        error_code = e.response.get("error") if e.response else str(e)
+        if error_code == "users_not_found":
+            respond(f"No Slack member found with email `{email}`.")
+        else:
+            logger.exception("users_lookupByEmail failed for %s", email)
+            respond(f"Slack API error looking up `{email}`: `{error_code}`")
+        return
+
+    assignee_id = lookup["user"]["id"]
+
+    # already registered? don't create a duplicate channel.
+    existing = get_registration_by_assignee(assignee_id)
+    if existing is not None:
+        respond(
+            f"<@{assignee_id}> is already registered to <#{existing['channel_id']}>. "
+            "Remove that mapping first if you need to re-register them."
+        )
+        return
+
+    created_by = command["user_id"]
+
+    # create the private channel
+    try:
+        create_resp = app.client.conversations_create(name=channel_name, is_private=True)
+    except SlackApiError as e:
+        error_code = e.response.get("error") if e.response else str(e)
+        if error_code == "name_taken":
+            respond(f"A channel named `{channel_name}` already exists. Pick a different name.")
+        else:
+            logger.exception("conversations_create failed for %s", channel_name)
+            respond(f"Slack API error creating channel `{channel_name}`: `{error_code}`")
+        return
+
+    channel_id = create_resp["channel"]["id"]
+
+    # invite assignee, the admin running the command, and both team leaders (deduped)
+    invite_ids = {assignee_id, created_by, *TEAM_LEADER_IDS}
+    invite_ids = list(invite_ids)
+
+    try:
+        app.client.conversations_invite(channel=channel_id, users=invite_ids)
+    except SlackApiError as e:
+        error_code = e.response.get("error") if e.response else str(e)
+        # already_in_channel / cant_invite_self type errors are harmless here, but
+        # anything else means the channel exists with the wrong membership — flag it.
+        if error_code not in ("already_in_channel",):
+            logger.exception("conversations_invite failed for channel %s", channel_id)
+            respond(
+                f"Channel <#{channel_id}> was created, but inviting members failed: "
+                f"`{error_code}`. You may need to invite people manually."
+            )
+
+    add_registration(assignee_id, channel_id, channel_name, email, created_by)
+
+    try:
+        app.client.chat_postMessage(
+            channel=channel_id,
+            text=(
+                f"This channel is set up for <@{assignee_id}>'s task reminders. "
+                f"Members: <@{assignee_id}>, <@{created_by}>, "
+                + ", ".join(f"<@{tl}>" for tl in TEAM_LEADER_IDS)
+            ),
+        )
+    except Exception:
+        logger.exception("Failed to post welcome message to channel %s", channel_id)
+
+    respond(f"Registered <@{assignee_id}> — created <#{channel_id}> (`{channel_name}`).")
+
+
 @app.command("/done")
 def handle_done(ack, respond, command):
     ack()
@@ -283,31 +428,26 @@ def handle_done(ack, respond, command):
 
 # hourly reminders ---------------------------------------------------------------------------
 
-def build_reminder_blocks(tasks_by_assignee, today_date):
-    blocks = []
-    for assignee_id, tasks in tasks_by_assignee.items():
-        tasks_sorted = sorted(
-            tasks,
-            key=lambda t: (
-                PRIORITY_RANK[effective_priority(t, today_date)],
-                t["due_date"],
-            ),
-        )
-        lines = [
-            f'• [{effective_priority(t, today_date)}] #{t["task_id"]} '
-            f'{t["description"]} — due {t["due_date"]}'
-            for t in tasks_sorted
-        ]
-        blocks.append(
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"<@{assignee_id}>\n" + "\n".join(lines),
-                },
-            }
-        )
-    return blocks
+def build_assignee_block(assignee_id, tasks, today_date):
+    tasks_sorted = sorted(
+        tasks,
+        key=lambda t: (
+            PRIORITY_RANK[effective_priority(t, today_date)],
+            t["due_date"],
+        ),
+    )
+    lines = [
+        f'• [{effective_priority(t, today_date)}] #{t["task_id"]} '
+        f'{t["description"]} — due {t["due_date"]}'
+        for t in tasks_sorted
+    ]
+    return {
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": f"<@{assignee_id}>\n" + "\n".join(lines),
+        },
+    }
 
 
 def send_hourly_reminders():
@@ -327,17 +467,37 @@ def send_hourly_reminders():
     for t in tasks:
         grouped[t["assignee_id"]].append(t)
 
-    blocks = build_reminder_blocks(grouped, now.date())
+    posted, unregistered = 0, []
 
-    try:
-        app.client.chat_postMessage(
-            channel=REMINDER_CHANNEL_ID,
-            text="Hourly task reminders",  # fallback text for notifications
-            blocks=blocks,
+    for assignee_id, assignee_tasks in grouped.items():
+        registration = get_registration_by_assignee(assignee_id)
+        if registration is None:
+            unregistered.append(assignee_id)
+            continue
+
+        block = build_assignee_block(assignee_id, assignee_tasks, now.date())
+
+        try:
+            app.client.chat_postMessage(
+                channel=registration["channel_id"],
+                text="Task reminders",  # fallback text for notifications
+                blocks=[block],
+            )
+            posted += 1
+        except Exception:
+            logger.exception(
+                "Failed to post reminders to channel %s for assignee %s",
+                registration["channel_id"],
+                assignee_id,
+            )
+
+    if unregistered:
+        logger.warning(
+            "Open tasks exist for unregistered assignee(s), skipped: %s",
+            ", ".join(unregistered),
         )
-        logger.info("Posted reminders for %d assignee(s).", len(grouped))
-    except Exception:
-        logger.exception("Failed to post hourly reminders.")
+
+    logger.info("Posted reminders to %d registered channel(s).", posted)
 
 # entry point ---------------------------------------------------------------------------
 
