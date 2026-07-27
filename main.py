@@ -19,18 +19,18 @@ logger = logging.getLogger("task-bot")
 # config
 # ---------------------------------------------------------------------------
 
-REMINDER_CHANNEL_ID = "C0BJTQ09GFL"  # hardcoded channel ID — no longer used for reminders, kept in case needed
-
+REMINDER_CHANNEL_ID = "C0BJTQ09GFL"  # hardcoded channel ID — no longer used for reminders,
+                                     # kept around in case you want an admin/log channel later
 DB_PATH = os.path.join(os.path.dirname(__file__), "tasks.db")
 
 # fixed team leaders who get added to every per-person registration channel.
-
+# fill these in with real Slack member IDs (find via user profile > "Copy member ID").
 TEAM_LEADER_IDS = [
     "U0B6L4YQ734",
     "U09453J1QBW",
 ]
 
-# DEV ID, always invited to every registration channel, regardless of who runs /register.
+# always invited to every registration channel, regardless of who runs /register.
 OWNER_ID = "U0BHJRZCLUQ"
 
 # set timezone to Eastern Time (handles EST/EDT automatically)
@@ -448,7 +448,7 @@ def handle_register(ack, respond, command):
             f"`{error_code}`. You may need to invite people manually."
         )
 
-    # FAIL-SAFE IN-CASE PERSON WASN'T ACTUALLY ADDED TO THE CHANNEL (e.g. wrong workspace, restricted account, etc.)
+    # FAIL-SAFE in case Slack's API quietly skips some members (wrong workspace, restricted account, etc.)
     # force=True means Slack can return ok:true while quietly skipping people it
     # couldn't add (wrong workspace, restricted account, etc.) — check who's
     # actually in the channel rather than trusting the invite call didn't raise.
@@ -543,6 +543,19 @@ def handle_unregister(ack, respond, command):
     except Exception:
         logger.exception("Failed to post unregister notice to channel %s", channel_id)
 
+    # Archiving does NOT free up the channel name — Slack still reserves it on the
+    # archived channel, so re-registering under the same name later would fail with
+    # name_taken. Rename it out of the way first so the original name is immediately
+    # available again.
+    archived_name = f"{channel_name}-archived-{int(now_est().timestamp())}"[:80]
+    try:
+        app.client.conversations_rename(channel=channel_id, name=archived_name)
+    except SlackApiError as e:
+        error_code = e.response.get("error") if e.response else str(e)
+        logger.exception("conversations_rename failed for channel %s", channel_id)
+        # Not fatal — proceed to archive anyway. The name just won't be freed up
+        # until this is renamed manually.
+
     archive_status = "archived"
     try:
         app.client.conversations_archive(channel=channel_id)
@@ -562,6 +575,99 @@ def handle_unregister(ack, respond, command):
         f"Unregistered <@{assignee_id}>. Channel `{channel_name}` (<#{channel_id}>): {archive_status}. "
         "Their registration mapping has been removed either way — any of their open tasks "
         "will now be skipped by reminders/reports until they're registered again."
+    )
+
+
+@app.command("/freechannel")
+def handle_freechannel(ack, respond, command):
+    ack()
+    name = command.get("text", "").strip().lower()
+
+    if not name:
+        respond(
+            "Usage: `/freechannel channel-name` — finds a channel by exact name "
+            "(active or archived) that TaskBot belongs to, and renames it out of "
+            "the way so you can `/register` under that name again. Use this for "
+            "orphaned channels that are no longer in the registrations table "
+            "(e.g. after a rename/archive failed, or before the auto-rename fix "
+            "was added to `/unregister`)."
+        )
+        return
+
+    if not CHANNEL_NAME_RE.match(name):
+        respond(f"`{name}` isn't a valid channel name to search for.")
+        return
+
+    channel = None
+    cursor = None
+    try:
+        while True:
+            list_resp = app.client.conversations_list(
+                types="private_channel,public_channel",
+                exclude_archived=False,
+                limit=200,
+                cursor=cursor,
+            )
+            for c in list_resp.get("channels", []):
+                if c.get("name") == name:
+                    channel = c
+                    break
+            if channel is not None:
+                break
+            cursor = list_resp.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+    except SlackApiError as e:
+        error_code = e.response.get("error") if e.response else str(e)
+        logger.exception("conversations_list failed while searching for %s", name)
+        respond(
+            f"Slack API error searching for `{name}`: `{error_code}`. "
+            "This command needs `channels:read` and `groups:read` bot scopes — "
+            "check those are granted if this keeps failing."
+        )
+        return
+
+    if channel is None:
+        respond(
+            f"Couldn't find a channel named `{name}` that TaskBot is a member of "
+            "(checked both active and archived channels)."
+        )
+        return
+
+    channel_id = channel["id"]
+    was_archived = channel.get("is_archived", False)
+
+    # Renaming an archived channel isn't allowed — unarchive first if needed.
+    if was_archived:
+        try:
+            app.client.conversations_unarchive(channel=channel_id)
+        except SlackApiError as e:
+            error_code = e.response.get("error") if e.response else str(e)
+            logger.exception("conversations_unarchive failed for %s", channel_id)
+            respond(f"Couldn't unarchive <#{channel_id}> to free its name: `{error_code}`")
+            return
+
+    new_name = f"{name}-archived-{int(now_est().timestamp())}"[:80]
+    try:
+        app.client.conversations_rename(channel=channel_id, name=new_name)
+    except SlackApiError as e:
+        error_code = e.response.get("error") if e.response else str(e)
+        logger.exception("conversations_rename failed for %s", channel_id)
+        respond(f"Couldn't rename <#{channel_id}>: `{error_code}`. Original name is still stuck.")
+        return
+
+    rearchive_note = ""
+    if was_archived:
+        try:
+            app.client.conversations_archive(channel=channel_id)
+        except SlackApiError as e:
+            error_code = e.response.get("error") if e.response else str(e)
+            logger.exception("Failed to re-archive %s after rename", channel_id)
+            rearchive_note = f" (couldn't re-archive it afterward: `{error_code}`, but the name is freed either way)"
+
+    respond(
+        f"Freed up `{name}` — that channel is now `{new_name}`{rearchive_note}. "
+        f"You can `/register` under `{name}` again."
     )
 
 
