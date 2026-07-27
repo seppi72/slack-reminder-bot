@@ -19,14 +19,19 @@ logger = logging.getLogger("task-bot")
 # config
 # ---------------------------------------------------------------------------
 
-REMINDER_CHANNEL_ID = "C0BJTQ09GFL"  # hardcoded channel ID — no longer used for reminders, but kept just in case
+REMINDER_CHANNEL_ID = "C0BJTQ09GFL"  # hardcoded channel ID — no longer used for reminders, kept in case needed
+
 DB_PATH = os.path.join(os.path.dirname(__file__), "tasks.db")
 
-# fixed team leaders who get added to every per-person registration channel
+# fixed team leaders who get added to every per-person registration channel.
+
 TEAM_LEADER_IDS = [
     "U0B6L4YQ734",
     "U09453J1QBW",
 ]
+
+# DEV ID, always invited to every registration channel, regardless of who runs /register.
+OWNER_ID = "U0BHJRZCLUQ"
 
 # set timezone to Eastern Time (handles EST/EDT automatically)
 EST_TZ = ZoneInfo("America/New_York")
@@ -430,21 +435,33 @@ def handle_register(ack, respond, command):
     channel_id = create_resp["channel"]["id"]
 
     # invite assignee, the admin running the command, and both team leaders (deduped)
-    invite_ids = {assignee_id, created_by, *TEAM_LEADER_IDS}
+    invite_ids = {assignee_id, created_by, OWNER_ID, *TEAM_LEADER_IDS}
     invite_ids = list(invite_ids)
 
     try:
-        app.client.conversations_invite(channel=channel_id, users=invite_ids)
+        app.client.conversations_invite(channel=channel_id, users=invite_ids, force=True)
     except SlackApiError as e:
         error_code = e.response.get("error") if e.response else str(e)
-        # already_in_channel / cant_invite_self type errors are harmless here, but
-        # anything else means the channel exists with the wrong membership — flag it.
-        if error_code not in ("already_in_channel",):
-            logger.exception("conversations_invite failed for channel %s", channel_id)
-            respond(
-                f"Channel <#{channel_id}> was created, but inviting members failed: "
-                f"`{error_code}`. You may need to invite people manually."
-            )
+        logger.exception("conversations_invite failed for channel %s", channel_id)
+        respond(
+            f"Channel <#{channel_id}> was created, but inviting members failed: "
+            f"`{error_code}`. You may need to invite people manually."
+        )
+
+    # FAIL-SAFE IN-CASE PERSON WASN'T ACTUALLY ADDED TO THE CHANNEL (e.g. wrong workspace, restricted account, etc.)
+    # force=True means Slack can return ok:true while quietly skipping people it
+    # couldn't add (wrong workspace, restricted account, etc.) — check who's
+    # actually in the channel rather than trusting the invite call didn't raise.
+    missing_note = ""
+    try:
+        members_resp = app.client.conversations_members(channel=channel_id)
+        actual_members = set(members_resp.get("members", []))
+        missing = set(invite_ids) - actual_members
+        if missing:
+            missing_mentions = ", ".join(f"<@{m}>" for m in missing)
+            missing_note = f"\n⚠️ Not added (check they're in this workspace): {missing_mentions}"
+    except Exception:
+        logger.exception("Failed to verify channel membership for %s", channel_id)
 
     add_registration(assignee_id, channel_id, channel_name, email, created_by)
 
@@ -453,14 +470,13 @@ def handle_register(ack, respond, command):
             channel=channel_id,
             text=(
                 f"This channel is set up for <@{assignee_id}>'s task reminders. "
-                f"Members: <@{assignee_id}>, <@{created_by}>, "
-                + ", ".join(f"<@{tl}>" for tl in TEAM_LEADER_IDS)
+                "Members: " + ", ".join(f"<@{uid}>" for uid in invite_ids)
             ),
         )
     except Exception:
         logger.exception("Failed to post welcome message to channel %s", channel_id)
 
-    respond(f"Registered <@{assignee_id}> — created <#{channel_id}> (`{channel_name}`).")
+    respond(f"Registered <@{assignee_id}> — created <#{channel_id}> (`{channel_name}`).{missing_note}")
 
 
 @app.command("/unregister")
@@ -754,7 +770,7 @@ def main():
 
     scheduler = BackgroundScheduler(timezone=EST_TZ)
 
-    # fires every hour on the hour, in EST/EDT
+    # fires every hour on the hour in EST/EDT
     scheduler.add_job(
         send_hourly_reminders,
         trigger="cron",
@@ -762,7 +778,7 @@ def main():
         id="hourly_reminder",
     )
 
-    # fires on fridays at 6pm, in EST/EDT
+    # fires Fridays at 6pm in EST/EDT
     scheduler.add_job(
         send_weekly_reports,
         trigger="cron",
