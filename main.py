@@ -54,6 +54,22 @@ DEFAULT_PRIORITY = "MEDIUM"
 
 PRIORITY_RANK = {"BACKLOG": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 
+# how often (in hours) each priority level gets re-reminded. The hourly job still
+# runs every hour, but a given task is only actually included in that hour's
+# reminder if at least this many hours have passed since it was last reminded.
+# BACKLOG (i.e. overdue) tasks nag hourly regardless of their original priority,
+# since something being overdue is more urgent than its original label.
+REMINDER_INTERVAL_HOURS = {
+    "HIGH": 1,
+    "MEDIUM": 12,
+    "LOW": 24,
+    "BACKLOG": 1,
+}
+
+# small buffer to absorb scheduler jitter (e.g. a job firing a few seconds late)
+# so a task doesn't get skipped by a hair right at its interval boundary.
+REMINDER_JITTER_BUFFER = timedelta(minutes=5)
+
 
 def effective_priority(task, today_date):
     """A task's priority for display/sort purposes: BACKLOG if its due date
@@ -84,7 +100,8 @@ MENTION_RE = re.compile(
 REST_RE = re.compile(
     r'^["\u201c](?P<description>[^"\u201d]+)["\u201d]\s+'
     r'(?P<due_date>\d{4}-\d{2}-\d{2})'
-    r'(?:\s+(?P<priority>HIGH|MEDIUM|LOW))?\s*$',
+    r'(?:\s+(?P<priority>HIGH|MEDIUM|LOW))?'
+    r'(?:\s+remind:(?P<remind_date>\d{4}-\d{2}-\d{2}))?\s*$',
     re.IGNORECASE,
 )
 
@@ -167,7 +184,9 @@ def init_db():
             status TEXT NOT NULL DEFAULT 'open',      -- open | done
             priority TEXT NOT NULL DEFAULT 'MEDIUM',  -- HIGH | MEDIUM | LOW
             created_by TEXT NOT NULL,
-            completed_at TEXT              -- ISO timestamp (Eastern Time), set when marked done
+            completed_at TEXT,             -- ISO timestamp (Eastern Time), set when marked done
+            remind_from TEXT,              -- 'YYYY-MM-DD'; reminders stay silent before this date (NULL = remind immediately)
+            last_reminded_at TEXT          -- ISO timestamp (Eastern Time) of the last reminder sent for this task
         )
         """
     )
@@ -195,6 +214,10 @@ def _migrate_columns():
     existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
     if "completed_at" not in existing_cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN completed_at TEXT")
+    if "remind_from" not in existing_cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN remind_from TEXT")
+    if "last_reminded_at" not in existing_cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN last_reminded_at TEXT")
     conn.commit()
     conn.close()
 
@@ -235,12 +258,12 @@ def delete_registration(assignee_id):
     return deleted > 0
 
 
-def add_task(description, assignee_id, due_date, priority, created_by):
+def add_task(description, assignee_id, due_date, priority, created_by, remind_from=None):
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO tasks (description, assignee_id, due_date, status, priority, created_by) "
-        "VALUES (?, ?, ?, 'open', ?, ?)",
-        (description, assignee_id, due_date, priority, created_by),
+        "INSERT INTO tasks (description, assignee_id, due_date, status, priority, created_by, remind_from) "
+        "VALUES (?, ?, ?, 'open', ?, ?, ?)",
+        (description, assignee_id, due_date, priority, created_by, remind_from),
     )
     conn.commit()
     task_id = cur.lastrowid
@@ -276,6 +299,21 @@ def mark_done(task_id):
     return updated > 0
 
 
+def mark_reminded(task_ids, when_iso):
+    """Stamp last_reminded_at on a batch of tasks right after a reminder for
+    them was successfully posted, so the next hourly run knows to wait out
+    that priority's interval before including them again."""
+    if not task_ids:
+        return
+    conn = get_conn()
+    conn.executemany(
+        "UPDATE tasks SET last_reminded_at = ? WHERE task_id = ?",
+        [(when_iso, task_id) for task_id in task_ids],
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_tasks_for_weekly_report(week_start_iso):
     """Every task relevant to this week's report: still-open tasks (regardless of when
     created) plus tasks completed since week_start_iso."""
@@ -300,7 +338,7 @@ def handle_task(ack, respond, command):
     if not mention_match:
         respond(
             'Couldn\'t find a person at the start. Format: '
-            '`/addtask @person "description" YYYY-MM-DD [HIGH|MEDIUM|LOW]`\n'
+            '`/addtask @person "description" YYYY-MM-DD [HIGH|MEDIUM|LOW] [remind:YYYY-MM-DD]`\n'
             f"Here's exactly what I received:\n```{text!r}```"
         )
         return
@@ -310,7 +348,7 @@ def handle_task(ack, respond, command):
     if not rest_match:
         respond(
             'Got the person, but couldn\'t parse the rest. Format: '
-            '`/addtask @person "description" YYYY-MM-DD [HIGH|MEDIUM|LOW]`\n'
+            '`/addtask @person "description" YYYY-MM-DD [HIGH|MEDIUM|LOW] [remind:YYYY-MM-DD]`\n'
             f"Here's exactly what I received:\n```{text!r}```"
         )
         return
@@ -340,12 +378,28 @@ def handle_task(ack, respond, command):
     priority_input = rest_match.group("priority")
     priority = priority_input.upper() if priority_input else DEFAULT_PRIORITY
 
-    created_by = command["user_id"]
-    task_id = add_task(description, assignee_id, due_date, priority, created_by)
+    remind_from = rest_match.group("remind_date")
+    if remind_from:
+        try:
+            remind_dt = datetime.strptime(remind_from, "%Y-%m-%d").date()
+        except ValueError:
+            respond("That `remind:` date doesn't look valid. Use YYYY-MM-DD (Eastern Time).")
+            return
+        due_dt = datetime.strptime(due_date, "%Y-%m-%d").date()
+        if remind_dt > due_dt:
+            respond("The `remind:` date has to be on or before the due date.")
+            return
 
+    created_by = command["user_id"]
+    task_id = add_task(description, assignee_id, due_date, priority, created_by, remind_from)
+
+    reminder_note = (
+        f" — reminders start {remind_from} (ET)" if remind_from
+        else ""
+    )
     respond(
         f'Task #{task_id} created for <@{assignee_id}>: "{description}" — '
-        f"due {due_date} (ET), priority {priority}"
+        f"due {due_date} (ET), priority {priority}{reminder_note}"
     )
 
 
@@ -744,8 +798,33 @@ def send_hourly_reminders():
         logger.info("No open tasks, skipping reminder post.")
         return
 
-    grouped = defaultdict(list)
+    due_tasks = []
     for t in tasks:
+        # tasks scheduled for a future date (remind_from) stay silent until then —
+        # e.g. a task due in two weeks that shouldn't nag hourly starting today.
+        remind_from = t["remind_from"]
+        if remind_from:
+            remind_from_date = datetime.strptime(remind_from, "%Y-%m-%d").date()
+            if remind_from_date > now.date():
+                continue
+
+        eff_priority = effective_priority(t, now.date())
+        interval_hours = REMINDER_INTERVAL_HOURS.get(eff_priority, 1)
+
+        last_reminded_at = t["last_reminded_at"]
+        if last_reminded_at:
+            last_dt = datetime.fromisoformat(last_reminded_at)
+            if (now - last_dt) < (timedelta(hours=interval_hours) - REMINDER_JITTER_BUFFER):
+                continue  # not due again yet — this priority's interval hasn't elapsed
+
+        due_tasks.append(t)
+
+    if not due_tasks:
+        logger.info("No tasks due for a reminder this hour.")
+        return
+
+    grouped = defaultdict(list)
+    for t in due_tasks:
         grouped[t["assignee_id"]].append(t)
 
     posted, unregistered = 0, []
@@ -776,6 +855,7 @@ def send_hourly_reminders():
                 blocks=[block],
             )
             posted += 1
+            mark_reminded([t["task_id"] for t in assignee_tasks], now.isoformat())
         except Exception:
             logger.exception(
                 "Failed to post reminders to channel %s for assignee %s",
