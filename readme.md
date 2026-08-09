@@ -101,11 +101,24 @@ A scheduled job runs every hour on the hour, Eastern Time. It only actually
 sends reminders during working hours (9am–9pm ET) — outside that window it's a
 no-op.
 
+Each task that's due for a reminder gets its own separate message in the
+assignee's channel, rather than one combined message listing everything at
+once. That makes each reminder easier to read and act on, and means a task
+can be marked done without hunting for it inside a longer list. When someone
+has several tasks due in the same hour, the posts to their channel are spaced
+out to stay under Slack's per-channel rate limit, so they arrive a second or
+so apart instead of all at once.
+
+Because each task is posted on its own, one task failing to send (a transient
+Slack error, say) no longer holds up the rest of that person's reminders —
+the others still go out, and only the failed one is retried on the next hourly
+run.
+
 ### Priority-based cadence
 
-Not every open task gets pinged every hour anymore. Each task is only included
-in an hour's reminder batch if enough time has passed since it was last
-reminded, based on its priority:
+Not every open task gets pinged every hour anymore. Each task is only reminded
+on a given run if enough time has passed since it was last reminded, based on
+its priority:
 
 | Priority | Reminded every |
 |---|---|
@@ -120,9 +133,11 @@ back to hourly nagging — the idea being that something overdue deserves more
 attention, not less.
 
 Internally this is tracked with a `last_reminded_at` timestamp on each task,
-stamped right after a reminder for it is successfully posted. There's a small
-5-minute buffer built into the interval check so a task doesn't get skipped by
-a few seconds of scheduler jitter right at its boundary.
+stamped individually the moment that task's own reminder posts successfully —
+so a task that did get reminded never gets nagged twice just because another
+of that person's reminders failed. There's a small 5-minute buffer built into
+the interval check so a task doesn't get skipped by a few seconds of scheduler
+jitter right at its boundary.
 
 ### Deferred reminders (`remind:`)
 

@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import sqlite3
 import logging
 from dotenv import load_dotenv
@@ -69,6 +70,12 @@ REMINDER_INTERVAL_HOURS = {
 # small buffer to absorb scheduler jitter (e.g. a job firing a few seconds late)
 # so a task doesn't get skipped by a hair right at its interval boundary.
 REMINDER_JITTER_BUFFER = timedelta(minutes=5)
+
+# reminders post one message per task, so a person with several due tasks gets
+# several consecutive posts into the same channel. Slack rate-limits chat.postMessage
+# to roughly 1 message/second/channel, so wait this long between consecutive posts
+# to the same channel.
+REMINDER_POST_DELAY_SECONDS = 1.1
 
 
 def effective_priority(task, today_date):
@@ -763,26 +770,31 @@ def handle_done(ack, respond, command):
 
 # hourly reminders ---------------------------------------------------------------------------
 
-def build_assignee_block(assignee_id, tasks, today_date):
-    tasks_sorted = sorted(
-        tasks,
-        key=lambda t: (
-            PRIORITY_RANK[effective_priority(t, today_date)],
-            t["due_date"],
-        ),
-    )
-    lines = [
-        f'• [{effective_priority(t, today_date)}] #{t["task_id"]} '
-        f'{t["description"]} — due {t["due_date"]}'
-        for t in tasks_sorted
-    ]
-    return {
+def build_task_block(assignee_id, task, today_date):
+    """One reminder message for one task: the Block Kit section to render, plus the
+    top-level `text` Slack uses for notification previews (mobile push, desktop
+    banner, sidebar unread) — those are driven by `text`, not by the blocks, so it
+    has to name the task rather than just say "reminder"."""
+    eff_priority = effective_priority(task, today_date)
+
+    block = {
         "type": "section",
         "text": {
             "type": "mrkdwn",
-            "text": f"<@{assignee_id}>\n" + "\n".join(lines),
+            "text": (
+                f"<@{assignee_id}>\n"
+                f'• [{eff_priority}] #{task["task_id"]} '
+                f'{task["description"]} — due {task["due_date"]}'
+            ),
         },
     }
+
+    if eff_priority == "BACKLOG":
+        summary = f'[BACKLOG] Task #{task["task_id"]} overdue — was due {task["due_date"]}'
+    else:
+        summary = f'[{eff_priority}] Task #{task["task_id"]} due {task["due_date"]}'
+
+    return block, summary
 
 
 def send_hourly_reminders():
@@ -827,7 +839,8 @@ def send_hourly_reminders():
     for t in due_tasks:
         grouped[t["assignee_id"]].append(t)
 
-    posted, unregistered = 0, []
+    posted, unregistered, failed = 0, [], []
+    channels_posted_to = set()
 
     for assignee_id, assignee_tasks in grouped.items():
         registration = get_registration_by_assignee(assignee_id)
@@ -835,33 +848,48 @@ def send_hourly_reminders():
             unregistered.append(assignee_id)
             continue
 
-        block = build_assignee_block(assignee_id, assignee_tasks, now.date())
+        channel_id = registration["channel_id"]
 
-        # Slack notification previews (mobile push, desktop banner, sidebar unread)
-        # are driven by this top-level "text", not by the blocks — so it needs to
-        # actually name the tasks, not just say "reminders".
-        count = len(assignee_tasks)
-        overdue_count = sum(
-            1 for t in assignee_tasks if effective_priority(t, now.date()) == "BACKLOG"
+        tasks_sorted = sorted(
+            assignee_tasks,
+            key=lambda t: (
+                PRIORITY_RANK[effective_priority(t, now.date())],
+                t["due_date"],
+            ),
         )
-        summary = f"You have {count} open task{'s' if count != 1 else ''}"
-        if overdue_count:
-            summary += f", {overdue_count} overdue"
 
-        try:
-            app.client.chat_postMessage(
-                channel=registration["channel_id"],
-                text=summary,
-                blocks=[block],
-            )
+        # One message per task, so each reminder gets its own notification preview
+        # and can be acted on individually.
+        for index, task in enumerate(tasks_sorted):
+            block, summary = build_task_block(assignee_id, task, now.date())
+
+            try:
+                app.client.chat_postMessage(
+                    channel=channel_id,
+                    text=summary,
+                    blocks=[block],
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to post reminder for task #%s to channel %s for assignee %s",
+                    task["task_id"],
+                    channel_id,
+                    assignee_id,
+                )
+                failed.append((task["task_id"], assignee_id))
+                continue
+
+            # Stamp this task immediately rather than batching the whole person's
+            # list at the end: if a later post fails or the process dies mid-loop,
+            # the tasks that did go out stay marked and don't get double-reminded.
             posted += 1
-            mark_reminded([t["task_id"] for t in assignee_tasks], now.isoformat())
-        except Exception:
-            logger.exception(
-                "Failed to post reminders to channel %s for assignee %s",
-                registration["channel_id"],
-                assignee_id,
-            )
+            channels_posted_to.add(channel_id)
+            mark_reminded([task["task_id"]], now.isoformat())
+
+            # Slack rate-limits per channel, so pace consecutive posts to the same
+            # channel — but don't stall before moving on to a different channel.
+            if index < len(tasks_sorted) - 1:
+                time.sleep(REMINDER_POST_DELAY_SECONDS)
 
     if unregistered:
         logger.warning(
@@ -869,7 +897,17 @@ def send_hourly_reminders():
             ", ".join(unregistered),
         )
 
-    logger.info("Posted reminders to %d registered channel(s).", posted)
+    logger.info(
+        "Posted %d reminder(s) across %d channel(s); %d failed.",
+        posted,
+        len(channels_posted_to),
+        len(failed),
+    )
+    if failed:
+        logger.warning(
+            "Reminder post failed for task/assignee pair(s): %s",
+            ", ".join(f"#{task_id} ({assignee_id})" for task_id, assignee_id in failed),
+        )
 
 # weekly report ---------------------------------------------------------------------------
 
