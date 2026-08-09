@@ -62,6 +62,24 @@ email; plain usernames are resolved via `resolve_username()` against `_user_cach
 in-memory cache of the workspace's member list that lazily refreshes on first use and on cache
 misses (new members, renamed handles).
 
+**Task editing** (`/edit <task_id> field:value [field:value ...]`): editable fields are
+`description`, `due`, `priority`, `remind_from`; no permission check (anyone can edit any task,
+matching `/done`), and no new DB columns. Parsing is field-name-based — the argument string is
+split on the known `field:` tokens, so unlike `/addtask` (whose description must be quoted)
+there is no quoting mechanism, and a `description` value containing literal `due:`/`priority:`/
+`remind_from:` text will be misparsed as the start of a new field. Validation mirrors
+`/addtask`'s (date format, priority in HIGH/MEDIUM/LOW, `remind_from` on or before `due`) and is
+atomic: every supplied field is validated first, and only if all pass is anything written, so a
+bad value never leaves a half-applied edit. The `remind_from <= due` check uses the
+post-edit values — the newly supplied one where given, the task's stored one otherwise — so it
+must not be evaluated against the old row. A field set to the value it already holds is a no-op:
+not written, not reported in the confirmation. Only an *actual* priority change (old != new)
+clears `last_reminded_at` to `NULL`, so the new cadence starts on the next hourly run rather
+than serving out the remainder of the old interval; restating the current priority must not
+reset it. Note that `/edit` is a new slash command and must be registered in the Slack app
+config (api.slack.com/apps → Slash Commands) before Slack routes it to the bot — a deploy alone
+is not enough, though no new scopes are needed.
+
 **Reminder cadence** (`send_hourly_reminders`, scheduled hourly via APScheduler): not every
 open task is reminded every run. A task is only included if enough time has passed since its
 `last_reminded_at`, per `REMINDER_INTERVAL_HOURS` (keyed by priority: HIGH/MEDIUM/LOW, plus
