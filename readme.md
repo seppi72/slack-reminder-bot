@@ -37,7 +37,29 @@ instead of one noisy shared channel.
 
 `chat:write`, `users:read`, `users:read.email`, `commands`, `channels:manage`,
 `groups:write`. `/freechannel` additionally needs `channels:read` and
-`groups:read`.
+`groups:read`. `/edit` needs no additional scopes — but it does need the
+one-time registration step below.
+
+### Registering the `/edit` slash command
+
+**This is a manual, one-time Slack-admin action, and `git pull` + `pm2 restart`
+does not do it for you.** A brand-new slash command has to exist in the Slack
+app's own configuration before Slack will route it to the bot — until then
+`/edit` just isn't a command as far as Slack is concerned, no matter what the
+deployed code does. This is completely separate from bot token scopes; `/edit`
+requires no new ones.
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) and open this app.
+2. **Slash Commands** → **Create New Command**.
+3. Command: `/edit`. Point it at this same app (Socket Mode means there's no
+   request URL to fill in — if the field is required, any placeholder URL works,
+   since Socket Mode delivers the payload over the existing connection).
+4. Give it a short description and usage hint, e.g.
+   `/edit <task_id> field:value [field:value ...]`, then save.
+5. If Slack prompts to reinstall the app to the workspace, do so.
+
+Existing commands (`/addtask`, `/done`, `/register`, `/unregister`,
+`/freechannel`) are already registered and don't need this.
 
 ## Commands
 
@@ -65,6 +87,58 @@ Examples:
 Marks a task done and confirms in the channel it was run in. DMs the assignee
 and the task's creator (whichever of the two didn't run the command) so nobody
 has to check the reminder channel to find out.
+
+### `/edit <task_id> field:value [field:value ...]`
+
+Changes one or more fields on an existing task without deleting and re-creating
+it. Like `/done`, there's no permission check — anyone can edit any task.
+
+Editable fields:
+
+| Field | Value |
+|---|---|
+| `description` | New task text. |
+| `due` | New due date, `YYYY-MM-DD` (Eastern Time). |
+| `priority` | `HIGH`, `MEDIUM`, or `LOW`. |
+| `remind_from` | New deferred-reminder start date, `YYYY-MM-DD` — see [Deferred reminders](#deferred-reminders-remind). |
+
+Notes:
+
+- **Same validation as `/addtask`.** Dates must be `YYYY-MM-DD`, priority must be
+  one of the three values, and `remind_from` must still be on or before `due` —
+  checked against whichever of the two ends up in effect after the edit (the new
+  value if you supplied one, otherwise the task's current value).
+- **All-or-nothing.** Every supplied field is validated before any of them is
+  applied, so one bad value rejects the whole command and the task is left
+  completely untouched. There's no partial edit to clean up.
+- **Changing the priority restarts the reminder clock.** If `priority` actually
+  changes to a different value, the task's `last_reminded_at` is cleared, so the
+  new priority's cadence takes effect on the next hourly run instead of waiting
+  out the remainder of the old interval. Restating the priority it already has
+  is a no-op and does *not* reset the clock.
+- **Setting a field to the value it already has counts as no change** — it isn't
+  applied and isn't listed in the confirmation.
+- The reply confirms exactly what changed, one line per field, as `old -> new`.
+- There's no quoting for `/edit` values (unlike `/addtask`'s required quoted
+  description), so a description containing something that looks like another
+  field — text with `due:` or `priority:` in it — will be misread as the start
+  of a new field. Reword it, or set the description via a separate `/edit`.
+
+Examples:
+```
+/edit 42 due:2026-08-20
+/edit 42 description:Follow up with vendor about the renewal due:2026-08-20 priority:HIGH
+/edit 42 priority:HIGH
+```
+The first pushes the due date out and leaves everything else alone. The second
+changes three fields at once — and if any one of them were invalid, none would
+be applied. The third bumps the priority to `HIGH` and clears the reminder
+timestamp, so the task starts nagging hourly right away rather than at the end
+of the old MEDIUM/LOW interval.
+
+**`/edit` needs no new bot scopes, but it does need to be registered as a slash
+command in the Slack app config before Slack will route it to the bot at all** —
+see [Registering the `/edit` slash command](#registering-the-edit-slash-command).
 
 ### `/register @person channel-name` or `/register email@company.com channel-name`
 
@@ -204,6 +278,11 @@ TABLE` needed.
   and convert it if appropriate. Not something the bot's scopes can fix.
 - **`TEAM_LEADER_IDS` / `OWNER_ID` left as placeholders** is a common cause of
   invite failures that otherwise look unrelated — check these first.
+- **Deploying a new slash command isn't enough to make it exist.** The command
+  also has to be created in the Slack app config, or Slack never routes it to
+  the bot and users just see "command not found" against perfectly working
+  deployed code. Nothing to do with scopes — see
+  [Registering the `/edit` slash command](#registering-the-edit-slash-command).
 
 ## Open items
 

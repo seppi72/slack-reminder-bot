@@ -129,6 +129,56 @@ UNREGISTER_MENTION_RE = re.compile(
     r'^\s*(?:<@(?P<user_id>\w+)(?:\|[^>]*)?>|@(?P<username>[A-Za-z0-9_.\-]+))\s*$'
 )
 
+# /edit — user-facing field name -> the tasks column it writes to. Only `due` differs
+# from its column name; the other three are spelled the same as their columns.
+EDIT_FIELD_COLUMNS = {
+    "description": "description",
+    "due": "due_date",
+    "priority": "priority",
+    "remind_from": "remind_from",
+}
+EDIT_FIELD_NAMES = set(EDIT_FIELD_COLUMNS)
+
+EDIT_TASK_ID_RE = re.compile(r'^\s*(?P<task_id>\d+)\s+(?P<fields>\S.*)$', re.DOTALL)
+# A field only starts at the beginning of the fields text or right after whitespace,
+# so `description:` isn't matched inside some longer word.
+EDIT_FIELD_RE = re.compile(
+    r'(?:^|(?<=\s))(description|due|priority|remind_from):', re.IGNORECASE
+)
+
+
+def parse_edit_command(text):
+    """Parse '<task_id> field:value [field:value ...]' (the text after '/edit ') into
+    (task_id: int, fields: dict[str, str]) with RAW, unvalidated string values (not yet
+    date-parsed or priority-checked — that happens in the command handler). Returns
+    (None, None) if it doesn't parse: missing/non-numeric task_id, no fields text at all,
+    or the fields text doesn't start with a recognized 'field:' token.
+
+    Each field's value runs from the end of its `field:` token to the start of the next
+    one, so a repeated field name means the LAST occurrence wins. Known limitation: with
+    no quoting mechanism, a `description` whose text literally contains e.g. `due:` gets
+    misparsed as the start of a new field — the same tradeoff the rest of this file's
+    regex parsing makes (only /addtask's description is quoted)."""
+    head = EDIT_TASK_ID_RE.match(text or "")
+    if not head:
+        return None, None
+
+    fields_text = head.group("fields")
+    matches = list(EDIT_FIELD_RE.finditer(fields_text))
+    if not matches:
+        return None, None
+    # garbage before the first recognized field means we misunderstood the command
+    if fields_text[: matches[0].start()].strip():
+        return None, None
+
+    fields = {}
+    for index, match in enumerate(matches):
+        value_end = matches[index + 1].start() if index + 1 < len(matches) else len(fields_text)
+        fields[match.group(1).lower()] = fields_text[match.end():value_end].strip()
+
+    return int(head.group("task_id")), fields
+
+
 _user_cache = {"by_username": {}, "fetched_at": None}
 
 
@@ -304,6 +354,24 @@ def mark_done(task_id):
     updated = cur.rowcount
     conn.close()
     return updated > 0
+
+
+def update_task(task_id, updates):
+    """updates: dict of column_name -> new value (may include 'last_reminded_at': None to
+    reset cadence). No-op if updates is empty."""
+    if not updates:
+        return
+    # Column names come from EDIT_FIELD_COLUMNS, never from user input — only the
+    # values are user-supplied, and those stay parameterized.
+    columns = list(updates.keys())
+    assignments = ", ".join(f"{col} = ?" for col in columns)
+    conn = get_conn()
+    conn.execute(
+        f"UPDATE tasks SET {assignments} WHERE task_id = ?",
+        [updates[col] for col in columns] + [task_id],
+    )
+    conn.commit()
+    conn.close()
 
 
 def mark_reminded(task_ids, when_iso):
@@ -767,6 +835,100 @@ def handle_done(ack, respond, command):
             )
         except Exception:
             logger.exception("Failed to DM %s about task #%s", user_id, task_id)
+
+
+@app.command("/edit")
+def handle_edit(ack, respond, command):
+    ack()
+    text = command.get("text", "")
+
+    task_id, fields = parse_edit_command(text)
+    if task_id is None:
+        respond(
+            "Usage: `/edit <task_id> field:value [field:value ...]` — editable fields: "
+            "description, due, priority, remind_from.\n"
+            "Example: `/edit 42 due:2026-08-20 priority:HIGH`\n"
+            f"Here's exactly what I received:\n```{text!r}```"
+        )
+        return
+
+    task = get_task(task_id)
+    if task is None:
+        respond(f"No task #{task_id} found.")
+        return
+
+    # Validate every supplied field before applying any of them — a bad value in one
+    # field must not leave the task half-updated.
+    validated = {}
+    for field, raw_value in fields.items():
+        value = raw_value.strip()
+        if field == "description":
+            if not value:
+                respond("The `description` can't be empty.")
+                return
+        elif field == "priority":
+            value = value.upper()
+            if value not in VALID_PRIORITIES:
+                valid = ", ".join(sorted(VALID_PRIORITIES, key=lambda p: PRIORITY_RANK[p]))
+                respond(f"`{raw_value}` isn't a valid `priority`. Use one of: {valid}.")
+                return
+        else:  # due / remind_from — both are plain YYYY-MM-DD dates
+            try:
+                # Re-format through strftime rather than storing the raw input: strptime
+                # itself accepts unpadded values like "2026-8-5", and storing that as-is
+                # would sort wrong (as a plain string) against every zero-padded due_date
+                # already in the DB, both in SQL's ORDER BY and in this file's Python
+                # sorts on due_date. Canonicalizing here keeps every stored date in the
+                # same YYYY-MM-DD shape /addtask's stricter regex already guarantees.
+                value = datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d")
+            except ValueError:
+                respond(
+                    f"That `{field}` date doesn't look valid. Use YYYY-MM-DD (Eastern Time)."
+                )
+                return
+        validated[field] = value
+
+    # Cross-field check against the state the task would END UP in, so editing only one
+    # of the two dates is still checked against the other's existing value.
+    resulting_due = validated.get("due", task["due_date"])
+    resulting_remind_from = validated.get("remind_from", task["remind_from"])
+    if resulting_remind_from and resulting_due:
+        remind_dt = datetime.strptime(resulting_remind_from, "%Y-%m-%d").date()
+        due_dt = datetime.strptime(resulting_due, "%Y-%m-%d").date()
+        if remind_dt > due_dt:
+            respond("The `remind_from` date has to be on or before the due date.")
+            return
+
+    # Only fields whose value actually differs count as a change — a no-op edit
+    # shouldn't claim it changed something or reset the reminder cadence.
+    updates, changes = {}, []
+    for field, value in validated.items():
+        column = EDIT_FIELD_COLUMNS[field]
+        current = task[column]
+        if field == "priority" and current:
+            current = current.upper()
+        if value == current:
+            continue
+        updates[column] = value
+        changes.append((field, current, value))
+
+    if not updates:
+        respond(f"No changes — task #{task_id} already matches what you specified.")
+        return
+
+    if "priority" in updates:
+        # Start the new priority's cadence now rather than waiting out however much
+        # of the old interval had already elapsed since the last reminder.
+        updates["last_reminded_at"] = None
+
+    update_task(task_id, updates)
+
+    lines = [f"Task #{task_id} updated:"]
+    for field, old, new in changes:
+        cadence_note = " (reminder cadence reset)" if field == "priority" else ""
+        lines.append(f"• {field}: {old if old is not None else '(none)'} -> {new}{cadence_note}")
+
+    respond("\n".join(lines))
 
 # hourly reminders ---------------------------------------------------------------------------
 
