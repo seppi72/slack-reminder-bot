@@ -20,10 +20,15 @@ Production is run under PM2: `pm2 start main.py --interpreter python3 --name tas
 
 There is no test suite, linter, or build step in this repo.
 
-Required `.env` (next to `main.py`):
+Required `.env` (next to `main.py`; copy `.env.example` as a starting point). Every
+workspace-identifying value — tokens, channel/user IDs — lives here, never hardcoded in
+`main.py`, since `.env` is git-ignored and nothing workspace-specific should end up committed:
 ```
 SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
+TEAM_LEADER_IDS=U0123ABCD,U0456EFGH   # comma-separated
+OWNER_ID=U0789IJKL
+REMINDER_CHANNEL_ID=                  # optional, currently unused
 ```
 
 Required Slack bot scopes: `chat:write`, `users:read`, `users:read.email`, `commands`,
@@ -33,11 +38,10 @@ additional scopes, but **do** need "Interactivity & Shortcuts" turned on for the
 api.slack.com/apps (no Request URL required under Socket Mode) — a one-time manual config step,
 the same category as registering a new slash command.
 
-Before this bot is functional, the config constants near the top of `main.py` must be filled
-in with real Slack member IDs: `TEAM_LEADER_IDS` (auto-invited to every registration channel)
-and `OWNER_ID` (always invited to every registration channel). Left as placeholders, these
-cause confusing invite failures that look unrelated to config — check them first when
-`/register` misbehaves.
+Before this bot is functional, `.env` must have real Slack member IDs for `TEAM_LEADER_IDS`
+(auto-invited to every registration channel) and `OWNER_ID` (always invited to every
+registration channel). Left unset, `main.py` logs a startup warning, but invites will still be
+incomplete — check `.env` first when `/register` misbehaves.
 
 ## Architecture
 
