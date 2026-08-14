@@ -28,7 +28,10 @@ SLACK_APP_TOKEN=xapp-...
 
 Required Slack bot scopes: `chat:write`, `users:read`, `users:read.email`, `commands`,
 `channels:manage`, `groups:write`. `/freechannel` additionally needs `channels:read` and
-`groups:read`.
+`groups:read`. The `/addtask` and `/edit` modals and the Done/Edit reminder buttons need no
+additional scopes, but **do** need "Interactivity & Shortcuts" turned on for the app at
+api.slack.com/apps (no Request URL required under Socket Mode) — a one-time manual config step,
+the same category as registering a new slash command.
 
 Before this bot is functional, the config constants near the top of `main.py` must be filled
 in with real Slack member IDs: `TEAM_LEADER_IDS` (auto-invited to every registration channel)
@@ -39,8 +42,8 @@ cause confusing invite failures that look unrelated to config — check them fir
 ## Architecture
 
 Everything lives in `main.py`, organized into clearly marked sections (search for the `# ---`
-banner comments): config, priority, non-working hours, command parsing, DB, slash commands,
-hourly reminders, weekly report, entry point.
+banner comments): config, priority, non-working hours, command parsing, DB, interactive
+components (modals & buttons), slash commands, hourly reminders, weekly report, entry point.
 
 **Storage**: SQLite at `tasks.db` (created next to `main.py`), two tables — `tasks` and
 `registrations`. `init_db()` creates both and then runs `_migrate_columns()`, which
@@ -67,18 +70,39 @@ misses (new members, renamed handles).
 matching `/done`), and no new DB columns. Parsing is field-name-based — the argument string is
 split on the known `field:` tokens, so unlike `/addtask` (whose description must be quoted)
 there is no quoting mechanism, and a `description` value containing literal `due:`/`priority:`/
-`remind_from:` text will be misparsed as the start of a new field. Validation mirrors
-`/addtask`'s (date format, priority in HIGH/MEDIUM/LOW, `remind_from` on or before `due`) and is
-atomic: every supplied field is validated first, and only if all pass is anything written, so a
-bad value never leaves a half-applied edit. The `remind_from <= due` check uses the
-post-edit values — the newly supplied one where given, the task's stored one otherwise — so it
-must not be evaluated against the old row. A field set to the value it already holds is a no-op:
-not written, not reported in the confirmation. Only an *actual* priority change (old != new)
-clears `last_reminded_at` to `NULL`, so the new cadence starts on the next hourly run rather
-than serving out the remainder of the old interval; restating the current priority must not
-reset it. Note that `/edit` is a new slash command and must be registered in the Slack app
+`remind_from:` text will be misparsed as the start of a new field. Validation and applying the
+edit are `validate_edit_fields()`/`apply_edit()` — the single source of truth used by both the
+typed command and the edit modal (see below), so a rule only has to be written once. Validation
+mirrors `/addtask`'s (date format, priority in HIGH/MEDIUM/LOW, `remind_from` on or before
+`due`) and is atomic: every supplied field is validated first, and only if all pass is anything
+written, so a bad value never leaves a half-applied edit. The `remind_from <= due` check uses
+the post-edit values — the newly supplied one where given, the task's stored one otherwise — so
+it must not be evaluated against the old row. A field set to the value it already holds is a
+no-op: not written, not reported in the confirmation. Only an *actual* priority change (old !=
+new) clears `last_reminded_at` to `NULL`, so the new cadence starts on the next hourly run
+rather than serving out the remainder of the old interval; restating the current priority must
+not reset it. Note that `/edit` is a slash command and must be registered in the Slack app
 config (api.slack.com/apps → Slash Commands) before Slack routes it to the bot — a deploy alone
 is not enough, though no new scopes are needed.
+
+**Modals & reminder buttons** (mobile-friendly alternative to typing the commands above):
+`/addtask` with no arguments, and `/edit <task_id>` with a bare task id and no `field:value`
+pairs, open a Block Kit modal (`build_addtask_modal()`/`build_edit_modal()`) instead of showing
+a usage error — a real user-picker, date-pickers, and a priority select, pre-filled from the
+task's current row for edits. Typed usage of both commands is completely unchanged; the modals
+are additive. Modal submissions are handled by `@app.view("addtask_modal")` and
+`@app.view("edit_task_modal")`; the edit one calls the same `validate_edit_fields()`/
+`apply_edit()` functions the typed `/edit` uses, so there's exactly one rulebook for what's a
+valid edit — a modal field error surfaces inline via `ack(response_action="errors", ...)`
+rather than a chat reply. Both modals carry the invoking channel (and, for edits, the task id)
+through `private_metadata` as JSON, since a view submission payload has no `channel_id` of its
+own; the confirmation posts back as a `chat_postEphemeral` into that channel. Every reminder
+message (`build_task_block()`) also gets a "✅ Done" / "✏️ Edit" actions row — `mark_done_btn`
+reuses `mark_done()` and a shared `notify_done()` helper (also used by `/done`) and replaces the
+message via `chat_update` so the buttons can't be double-clicked; `edit_task_btn` opens the same
+edit modal `/edit <task_id>` would. None of this needs new OAuth scopes, but it does need
+"Interactivity & Shortcuts" turned on for the app (see Commands section above) — without it,
+Slack silently fails to deliver the modal-open request and view submissions.
 
 **Reminder cadence** (`send_hourly_reminders`, scheduled hourly via APScheduler): not every
 open task is reminded every run. A task is only included if enough time has passed since its
@@ -89,8 +113,9 @@ reminder purposes regardless of its original priority, and reverts to hourly nag
 task's current (as opposed to originally-set) priority matters. Reminders are also silent
 entirely outside 9am–9pm ET (`is_working_hours`), and a task with a future `remind_from`
 (`remind:` flag on `/addtask`) stays silent until that date regardless of priority. Each due
-task gets its own `chat_postMessage` (one per-task block builder, no bundling of an assignee's
-tasks into a single message), with `REMINDER_POST_DELAY_SECONDS` (~1.1s) slept between
+task gets its own `chat_postMessage` (one per-task block builder returning a section + a
+Done/Edit actions row, no bundling of an assignee's tasks into a single message), with
+`REMINDER_POST_DELAY_SECONDS` (~1.1s) slept between
 consecutive posts to the same channel to stay under Slack's ~1 msg/sec/channel limit — so
 posting is deliberately not the place to add more per-task Slack API calls. `last_reminded_at`
 is stamped per task immediately after that task's own post succeeds, never batched for the
