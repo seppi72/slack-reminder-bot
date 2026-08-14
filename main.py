@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import time
 import sqlite3
 import logging
@@ -54,6 +55,22 @@ VALID_PRIORITIES = {"HIGH", "MEDIUM", "LOW"}
 DEFAULT_PRIORITY = "MEDIUM"
 
 PRIORITY_RANK = {"BACKLOG": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+
+# static_select options shared by the /addtask and /edit modals (order = HIGH -> LOW,
+# matching PRIORITY_RANK's urgency ordering).
+PRIORITY_OPTIONS = [
+    {"text": {"type": "plain_text", "text": p}, "value": p}
+    for p in ("HIGH", "MEDIUM", "LOW")
+]
+
+
+def _option_for_priority(priority):
+    """The PRIORITY_OPTIONS entry to preselect for a given priority value, so a
+    static_select's initial_option always matches one of its own options exactly."""
+    for option in PRIORITY_OPTIONS:
+        if option["value"] == priority:
+            return option
+    return _option_for_priority(DEFAULT_PRIORITY)
 
 # how often (in hours) each priority level gets re-reminded. The hourly job still
 # runs every hour, but a given task is only actually included in that hour's
@@ -374,6 +391,83 @@ def update_task(task_id, updates):
     conn.close()
 
 
+def validate_edit_fields(task, raw_fields):
+    """Validate raw, unvalidated field values (as parse_edit_command produces, or as
+    built from a submitted /edit modal) against the task they'd be applied to. This is
+    the single source of truth for /edit validation — both the typed `/edit <id>
+    field:value` command and the edit modal call this, so a rule only has to be written
+    once.
+
+    Returns (validated: dict[str, str], error_field: str | None, error_message: str | None).
+    On success error_field/error_message are both None; on failure validated is None and
+    error_field names which field to blame (useful for a modal's inline field errors —
+    the text command just shows error_message).
+    """
+    validated = {}
+    for field, raw_value in raw_fields.items():
+        value = (raw_value or "").strip()
+        if field == "description":
+            if not value:
+                return None, "description", "The `description` can't be empty."
+        elif field == "priority":
+            value = value.upper()
+            if value not in VALID_PRIORITIES:
+                valid = ", ".join(sorted(VALID_PRIORITIES, key=lambda p: PRIORITY_RANK[p]))
+                return None, "priority", f"`{raw_value}` isn't a valid `priority`. Use one of: {valid}."
+        else:  # due / remind_from — both are plain YYYY-MM-DD dates
+            try:
+                # Re-format through strftime rather than storing the raw input: strptime
+                # itself accepts unpadded values like "2026-8-5", and storing that as-is
+                # would sort wrong (as a plain string) against every zero-padded due_date
+                # already in the DB, both in SQL's ORDER BY and in this file's Python
+                # sorts on due_date. Canonicalizing here keeps every stored date in the
+                # same YYYY-MM-DD shape /addtask's stricter regex already guarantees.
+                value = datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d")
+            except ValueError:
+                return None, field, f"That `{field}` date doesn't look valid. Use YYYY-MM-DD (Eastern Time)."
+        validated[field] = value
+
+    # Cross-field check against the state the task would END UP in, so editing only one
+    # of the two dates is still checked against the other's existing value.
+    resulting_due = validated.get("due", task["due_date"])
+    resulting_remind_from = validated.get("remind_from", task["remind_from"])
+    if resulting_remind_from and resulting_due:
+        remind_dt = datetime.strptime(resulting_remind_from, "%Y-%m-%d").date()
+        due_dt = datetime.strptime(resulting_due, "%Y-%m-%d").date()
+        if remind_dt > due_dt:
+            return None, "remind_from", "The `remind_from` date has to be on or before the due date."
+
+    return validated, None, None
+
+
+def apply_edit(task_id, task, validated):
+    """Write only the fields that actually differ from the task's current values (a field
+    resubmitted with its existing value is a no-op, same as the typed /edit command), reset
+    the reminder cadence on an actual priority change, and return the list of (field, old,
+    new) changes that were applied (empty if nothing changed)."""
+    updates, changes = {}, []
+    for field, value in validated.items():
+        column = EDIT_FIELD_COLUMNS[field]
+        current = task[column]
+        if field == "priority" and current:
+            current = current.upper()
+        if value == current:
+            continue
+        updates[column] = value
+        changes.append((field, current, value))
+
+    if not updates:
+        return changes
+
+    if "priority" in updates:
+        # Start the new priority's cadence now rather than waiting out however much
+        # of the old interval had already elapsed since the last reminder.
+        updates["last_reminded_at"] = None
+
+    update_task(task_id, updates)
+    return changes
+
+
 def mark_reminded(task_ids, when_iso):
     """Stamp last_reminded_at on a batch of tasks right after a reminder for
     them was successfully posted, so the next hourly run knows to wait out
@@ -402,18 +496,149 @@ def get_tasks_for_weekly_report(week_start_iso):
     conn.close()
     return rows
 
+# interactive components (modals & buttons) ------------------------------------------------
+#
+# /addtask and /edit are usable two ways: the original typed one-liner (unchanged, still the
+# only option for scripting/muscle memory), or — when invoked with no arguments (/addtask) or
+# just a bare task id (/edit <id>) — a Block Kit modal with real form fields (user-picker,
+# date-pickers, a priority select), which is far less finicky on mobile than typing quoted
+# strings and YYYY-MM-DD dates by hand. Both modals, and the Done/Edit buttons attached to
+# every reminder message, funnel through the same DB helpers and (for /edit) the same
+# validate_edit_fields/apply_edit functions the typed command uses, so there is exactly one
+# rulebook for what's valid. Requires "Interactivity & Shortcuts" to be turned on for the app
+# at api.slack.com/apps (no Request URL needed under Socket Mode) — no new OAuth scopes.
+
+def build_addtask_modal(private_metadata):
+    return {
+        "type": "modal",
+        "callback_id": "addtask_modal",
+        "private_metadata": private_metadata,
+        "title": {"type": "plain_text", "text": "Add task"},
+        "submit": {"type": "plain_text", "text": "Create"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "assignee_block",
+                "label": {"type": "plain_text", "text": "Assignee"},
+                "element": {"type": "users_select", "action_id": "assignee_select"},
+            },
+            {
+                "type": "input",
+                "block_id": "description_block",
+                "label": {"type": "plain_text", "text": "Description"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "description_input",
+                    "multiline": True,
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "due_block",
+                "label": {"type": "plain_text", "text": "Due date"},
+                "element": {"type": "datepicker", "action_id": "due_input"},
+            },
+            {
+                "type": "input",
+                "block_id": "priority_block",
+                "label": {"type": "plain_text", "text": "Priority"},
+                "element": {
+                    "type": "static_select",
+                    "action_id": "priority_select",
+                    "options": PRIORITY_OPTIONS,
+                    "initial_option": _option_for_priority(DEFAULT_PRIORITY),
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "remind_block",
+                "optional": True,
+                "label": {"type": "plain_text", "text": "Remind starting (optional)"},
+                "element": {"type": "datepicker", "action_id": "remind_input"},
+                "hint": {"type": "plain_text", "text": "Reminders stay silent until this date."},
+            },
+        ],
+    }
+
+
+def build_edit_modal(task, private_metadata):
+    due_element = {"type": "datepicker", "action_id": "due_input"}
+    if task["due_date"]:
+        due_element["initial_date"] = task["due_date"]
+
+    remind_element = {"type": "datepicker", "action_id": "remind_input"}
+    if task["remind_from"]:
+        remind_element["initial_date"] = task["remind_from"]
+
+    return {
+        "type": "modal",
+        "callback_id": "edit_task_modal",
+        "private_metadata": private_metadata,
+        "title": {"type": "plain_text", "text": f"Edit task #{task['task_id']}"},
+        "submit": {"type": "plain_text", "text": "Save"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "description_block",
+                "label": {"type": "plain_text", "text": "Description"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "description_input",
+                    "multiline": True,
+                    "initial_value": task["description"],
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "due_block",
+                "label": {"type": "plain_text", "text": "Due date"},
+                "element": due_element,
+            },
+            {
+                "type": "input",
+                "block_id": "priority_block",
+                "label": {"type": "plain_text", "text": "Priority"},
+                "element": {
+                    "type": "static_select",
+                    "action_id": "priority_select",
+                    "options": PRIORITY_OPTIONS,
+                    "initial_option": _option_for_priority(task["priority"]),
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "remind_block",
+                "optional": True,
+                "label": {"type": "plain_text", "text": "Remind starting (optional)"},
+                "element": remind_element,
+                "hint": {"type": "plain_text", "text": "Leave blank to keep it unchanged — there's no way to clear it back to unset here."},
+            },
+        ],
+    }
+
+
 # slash commands ---------------------------------------------------------------------------
 
 @app.command("/addtask")
-def handle_task(ack, respond, command):
+def handle_task(ack, respond, command, client):
     ack()
     text = command.get("text", "")
+
+    if not text.strip():
+        client.views_open(
+            trigger_id=command["trigger_id"],
+            view=build_addtask_modal(json.dumps({"channel_id": command["channel_id"]})),
+        )
+        return
 
     mention_match = MENTION_RE.match(text)
     if not mention_match:
         respond(
             'Couldn\'t find a person at the start. Format: '
             '`/addtask @person "description" YYYY-MM-DD [HIGH|MEDIUM|LOW] [remind:YYYY-MM-DD]`\n'
+            'Or just run `/addtask` with nothing after it to fill out a form instead.\n'
             f"Here's exactly what I received:\n```{text!r}```"
         )
         return
@@ -800,8 +1025,24 @@ def handle_freechannel(ack, respond, command):
     )
 
 
+def notify_done(client, task, actor_id):
+    """DM the assignee and creator that a task was marked done, skipping whichever of
+    them triggered the action themselves. Shared by /done and the reminder message's
+    Done button."""
+    notify_ids = {task["assignee_id"], task["created_by"]}
+    notify_ids.discard(actor_id)
+    for user_id in notify_ids:
+        try:
+            client.chat_postMessage(
+                channel=user_id,
+                text=f'Task #{task["task_id"]} ("{task["description"]}") was marked done.',
+            )
+        except Exception:
+            logger.exception("Failed to DM %s about task #%s", user_id, task["task_id"])
+
+
 @app.command("/done")
-def handle_done(ack, respond, command):
+def handle_done(ack, respond, command, client):
     ack()
     text = command.get("text", "").strip()
 
@@ -823,31 +1064,38 @@ def handle_done(ack, respond, command):
     mark_done(task_id)
 
     respond(f'Task #{task_id} ("{task["description"]}") marked done.')
-
-    # confirm to the assignee (if the caller wasn't the assignee) and the creator.
-    notify_ids = {task["assignee_id"], task["created_by"]}
-    notify_ids.discard(command["user_id"])
-    for user_id in notify_ids:
-        try:
-            app.client.chat_postMessage(
-                channel=user_id,
-                text=f'Task #{task_id} ("{task["description"]}") was marked done.',
-            )
-        except Exception:
-            logger.exception("Failed to DM %s about task #%s", user_id, task_id)
+    notify_done(client, task, command["user_id"])
 
 
 @app.command("/edit")
-def handle_edit(ack, respond, command):
+def handle_edit(ack, respond, command, client):
     ack()
     text = command.get("text", "")
 
     task_id, fields = parse_edit_command(text)
     if task_id is None:
+        # A bare task id with no field:value pairs (e.g. "/edit 42") opens a form
+        # pre-filled with that task instead of erroring.
+        stripped = text.strip()
+        if stripped.isdigit():
+            task = get_task(int(stripped))
+            if task is None:
+                respond(f"No task #{int(stripped)} found.")
+                return
+            client.views_open(
+                trigger_id=command["trigger_id"],
+                view=build_edit_modal(task, json.dumps({
+                    "task_id": task["task_id"],
+                    "channel_id": command["channel_id"],
+                })),
+            )
+            return
+
         respond(
             "Usage: `/edit <task_id> field:value [field:value ...]` — editable fields: "
             "description, due, priority, remind_from.\n"
             "Example: `/edit 42 due:2026-08-20 priority:HIGH`\n"
+            "Or just `/edit <task_id>` with nothing else to fill out a form instead.\n"
             f"Here's exactly what I received:\n```{text!r}```"
         )
         return
@@ -857,71 +1105,15 @@ def handle_edit(ack, respond, command):
         respond(f"No task #{task_id} found.")
         return
 
-    # Validate every supplied field before applying any of them — a bad value in one
-    # field must not leave the task half-updated.
-    validated = {}
-    for field, raw_value in fields.items():
-        value = raw_value.strip()
-        if field == "description":
-            if not value:
-                respond("The `description` can't be empty.")
-                return
-        elif field == "priority":
-            value = value.upper()
-            if value not in VALID_PRIORITIES:
-                valid = ", ".join(sorted(VALID_PRIORITIES, key=lambda p: PRIORITY_RANK[p]))
-                respond(f"`{raw_value}` isn't a valid `priority`. Use one of: {valid}.")
-                return
-        else:  # due / remind_from — both are plain YYYY-MM-DD dates
-            try:
-                # Re-format through strftime rather than storing the raw input: strptime
-                # itself accepts unpadded values like "2026-8-5", and storing that as-is
-                # would sort wrong (as a plain string) against every zero-padded due_date
-                # already in the DB, both in SQL's ORDER BY and in this file's Python
-                # sorts on due_date. Canonicalizing here keeps every stored date in the
-                # same YYYY-MM-DD shape /addtask's stricter regex already guarantees.
-                value = datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d")
-            except ValueError:
-                respond(
-                    f"That `{field}` date doesn't look valid. Use YYYY-MM-DD (Eastern Time)."
-                )
-                return
-        validated[field] = value
-
-    # Cross-field check against the state the task would END UP in, so editing only one
-    # of the two dates is still checked against the other's existing value.
-    resulting_due = validated.get("due", task["due_date"])
-    resulting_remind_from = validated.get("remind_from", task["remind_from"])
-    if resulting_remind_from and resulting_due:
-        remind_dt = datetime.strptime(resulting_remind_from, "%Y-%m-%d").date()
-        due_dt = datetime.strptime(resulting_due, "%Y-%m-%d").date()
-        if remind_dt > due_dt:
-            respond("The `remind_from` date has to be on or before the due date.")
-            return
-
-    # Only fields whose value actually differs count as a change — a no-op edit
-    # shouldn't claim it changed something or reset the reminder cadence.
-    updates, changes = {}, []
-    for field, value in validated.items():
-        column = EDIT_FIELD_COLUMNS[field]
-        current = task[column]
-        if field == "priority" and current:
-            current = current.upper()
-        if value == current:
-            continue
-        updates[column] = value
-        changes.append((field, current, value))
-
-    if not updates:
-        respond(f"No changes — task #{task_id} already matches what you specified.")
+    validated, error_field, error_message = validate_edit_fields(task, fields)
+    if error_message:
+        respond(error_message)
         return
 
-    if "priority" in updates:
-        # Start the new priority's cadence now rather than waiting out however much
-        # of the old interval had already elapsed since the last reminder.
-        updates["last_reminded_at"] = None
-
-    update_task(task_id, updates)
+    changes = apply_edit(task_id, task, validated)
+    if not changes:
+        respond(f"No changes — task #{task_id} already matches what you specified.")
+        return
 
     lines = [f"Task #{task_id} updated:"]
     for field, old, new in changes:
@@ -930,16 +1122,189 @@ def handle_edit(ack, respond, command):
 
     respond("\n".join(lines))
 
+
+@app.view("addtask_modal")
+def handle_addtask_submission(ack, body, view, client):
+    values = view["state"]["values"]
+    assignee_id = values["assignee_block"]["assignee_select"]["selected_user"]
+    description = (values["description_block"]["description_input"]["value"] or "").strip()
+    due_date = values["due_block"]["due_input"]["selected_date"]
+    priority_option = values["priority_block"]["priority_select"]["selected_option"]
+    priority = priority_option["value"] if priority_option else DEFAULT_PRIORITY
+    remind_from = values["remind_block"]["remind_input"].get("selected_date")
+
+    errors = {}
+    if not assignee_id:
+        errors["assignee_block"] = "Pick an assignee."
+    if not description:
+        errors["description_block"] = "Description can't be empty."
+    if not due_date:
+        errors["due_block"] = "Pick a due date."
+    if remind_from and due_date:
+        remind_dt = datetime.strptime(remind_from, "%Y-%m-%d").date()
+        due_dt = datetime.strptime(due_date, "%Y-%m-%d").date()
+        if remind_dt > due_dt:
+            errors["remind_block"] = "Has to be on or before the due date."
+
+    if errors:
+        ack(response_action="errors", errors=errors)
+        return
+
+    ack()
+
+    created_by = body["user"]["id"]
+    task_id = add_task(description, assignee_id, due_date, priority, created_by, remind_from)
+
+    reminder_note = f" — reminders start {remind_from} (ET)" if remind_from else ""
+    text = (
+        f'Task #{task_id} created for <@{assignee_id}>: "{description}" — '
+        f"due {due_date} (ET), priority {priority}{reminder_note}"
+    )
+
+    metadata = json.loads(view.get("private_metadata") or "{}")
+    channel_id = metadata.get("channel_id")
+    if channel_id:
+        try:
+            client.chat_postEphemeral(channel=channel_id, user=created_by, text=text)
+        except Exception:
+            logger.exception("Failed to post addtask-modal confirmation to channel %s", channel_id)
+
+
+@app.view("edit_task_modal")
+def handle_edit_submission(ack, body, view, client):
+    metadata = json.loads(view.get("private_metadata") or "{}")
+    task_id = metadata.get("task_id")
+    channel_id = metadata.get("channel_id")
+    editor_id = body["user"]["id"]
+
+    task = get_task(task_id)
+    if task is None:
+        # Task vanished (deleted/completed elsewhere) between modal-open and submit —
+        # nothing sane to apply.
+        ack()
+        if channel_id:
+            try:
+                client.chat_postEphemeral(
+                    channel=channel_id, user=editor_id, text=f"No task #{task_id} found — it may have changed."
+                )
+            except Exception:
+                logger.exception("Failed to post edit-modal not-found notice to channel %s", channel_id)
+        return
+
+    values = view["state"]["values"]
+    raw_fields = {
+        "description": values["description_block"]["description_input"]["value"],
+        "due": values["due_block"]["due_input"]["selected_date"],
+        "priority": values["priority_block"]["priority_select"]["selected_option"]["value"],
+        "remind_from": values["remind_block"]["remind_input"].get("selected_date"),
+    }
+    # remind_from is optional in the modal — an unset/cleared date picker means "leave
+    # unchanged", the same as simply not supplying remind_from: to the typed command.
+    if not raw_fields["remind_from"]:
+        del raw_fields["remind_from"]
+
+    if not raw_fields["description"] or not raw_fields["description"].strip():
+        ack(response_action="errors", errors={"description_block": "The description can't be empty."})
+        return
+    if not raw_fields["due"]:
+        ack(response_action="errors", errors={"due_block": "Pick a due date."})
+        return
+
+    validated, error_field, error_message = validate_edit_fields(task, raw_fields)
+    if error_message:
+        block_id = f"{error_field}_block" if error_field in EDIT_FIELD_COLUMNS else "due_block"
+        ack(response_action="errors", errors={block_id: error_message})
+        return
+
+    ack()
+    changes = apply_edit(task_id, task, validated)
+
+    if not channel_id:
+        return
+    if not changes:
+        text = f"No changes — task #{task_id} already matched what you specified."
+    else:
+        lines = [f"Task #{task_id} updated:"]
+        for field, old, new in changes:
+            cadence_note = " (reminder cadence reset)" if field == "priority" else ""
+            lines.append(f"• {field}: {old if old is not None else '(none)'} -> {new}{cadence_note}")
+        text = "\n".join(lines)
+
+    try:
+        client.chat_postEphemeral(channel=channel_id, user=editor_id, text=text)
+    except Exception:
+        logger.exception("Failed to post edit-modal confirmation to channel %s", channel_id)
+
+
+@app.action("mark_done_btn")
+def handle_mark_done_action(ack, body, client):
+    ack()
+    task_id = int(body["actions"][0]["value"])
+    actor_id = body["user"]["id"]
+    channel_id = body["channel"]["id"]
+    message_ts = body["message"]["ts"]
+
+    task = get_task(task_id)
+    if task is None:
+        client.chat_postEphemeral(channel=channel_id, user=actor_id, text=f"No task #{task_id} found.")
+        return
+
+    if task["status"] == "done":
+        client.chat_postEphemeral(channel=channel_id, user=actor_id, text=f"Task #{task_id} is already marked done.")
+        return
+
+    mark_done(task_id)
+
+    # Replace the reminder message in place with a static, button-free confirmation so
+    # the action can't be repeated and finished tasks don't leave live buttons behind.
+    try:
+        client.chat_update(
+            channel=channel_id,
+            ts=message_ts,
+            text=f"Task #{task_id} marked done.",
+            blocks=[{
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f'✅ [{effective_priority(task, now_est().date())}] #{task_id} '
+                            f'{task["description"]} — marked done by <@{actor_id}>',
+                },
+            }],
+        )
+    except Exception:
+        logger.exception("Failed to update reminder message for task #%s after marking done", task_id)
+
+    notify_done(client, task, actor_id)
+
+
+@app.action("edit_task_btn")
+def handle_edit_action(ack, body, client):
+    ack()
+    task_id = int(body["actions"][0]["value"])
+    actor_id = body["user"]["id"]
+    channel_id = body["channel"]["id"]
+
+    task = get_task(task_id)
+    if task is None:
+        client.chat_postEphemeral(channel=channel_id, user=actor_id, text=f"No task #{task_id} found.")
+        return
+
+    client.views_open(
+        trigger_id=body["trigger_id"],
+        view=build_edit_modal(task, json.dumps({"task_id": task_id, "channel_id": channel_id})),
+    )
+
 # hourly reminders ---------------------------------------------------------------------------
 
 def build_task_block(assignee_id, task, today_date):
-    """One reminder message for one task: the Block Kit section to render, plus the
-    top-level `text` Slack uses for notification previews (mobile push, desktop
-    banner, sidebar unread) — those are driven by `text`, not by the blocks, so it
-    has to name the task rather than just say "reminder"."""
+    """One reminder message for one task: the list of Block Kit blocks to render (a
+    section plus a Done/Edit actions row, so acting on the reminder needs no typing),
+    plus the top-level `text` Slack uses for notification previews (mobile push,
+    desktop banner, sidebar unread) — those are driven by `text`, not by the blocks,
+    so it has to name the task rather than just say "reminder"."""
     eff_priority = effective_priority(task, today_date)
 
-    block = {
+    section = {
         "type": "section",
         "text": {
             "type": "mrkdwn",
@@ -950,13 +1315,32 @@ def build_task_block(assignee_id, task, today_date):
             ),
         },
     }
+    actions = {
+        "type": "actions",
+        "block_id": f"task_actions_{task['task_id']}",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "✅ Done"},
+                "style": "primary",
+                "action_id": "mark_done_btn",
+                "value": str(task["task_id"]),
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "✏️ Edit"},
+                "action_id": "edit_task_btn",
+                "value": str(task["task_id"]),
+            },
+        ],
+    }
 
     if eff_priority == "BACKLOG":
         summary = f'[BACKLOG] Task #{task["task_id"]} overdue — was due {task["due_date"]}'
     else:
         summary = f'[{eff_priority}] Task #{task["task_id"]} due {task["due_date"]}'
 
-    return block, summary
+    return [section, actions], summary
 
 
 def send_hourly_reminders():
@@ -1023,13 +1407,13 @@ def send_hourly_reminders():
         # One message per task, so each reminder gets its own notification preview
         # and can be acted on individually.
         for index, task in enumerate(tasks_sorted):
-            block, summary = build_task_block(assignee_id, task, now.date())
+            blocks, summary = build_task_block(assignee_id, task, now.date())
 
             try:
                 app.client.chat_postMessage(
                     channel=channel_id,
                     text=summary,
-                    blocks=[block],
+                    blocks=blocks,
                 )
             except Exception:
                 logger.exception(
