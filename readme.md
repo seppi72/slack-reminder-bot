@@ -16,19 +16,23 @@ instead of one noisy shared channel.
 ## Setup
 
 1. Install dependencies (Slack Bolt, `apscheduler`, `python-dotenv`).
-2. Create a `.env` file next to `main.py` with:
+2. Create a `.env` file next to `main.py` (copy `.env.example` as a starting point)
+   with:
    ```
    SLACK_BOT_TOKEN=xoxb-...
    SLACK_APP_TOKEN=xapp-...
+   TEAM_LEADER_IDS=U0123ABCD,U0456EFGH
+   OWNER_ID=U0789IJKL
    ```
-3. In `main.py`, fill in the config constants near the top with real values:
-   - `TEAM_LEADER_IDS` — Slack member IDs that get auto-invited to every
-     registration channel.
+   - `TEAM_LEADER_IDS` — comma-separated Slack member IDs that get auto-invited to
+     every registration channel.
    - `OWNER_ID` — Slack member ID always invited to every registration channel.
 
-   These are still placeholders (`UTEAMLEADER1`, `UTEAMLEADER2`, `UOWNERID`) —
-   leaving them unset causes confusing, hard-to-diagnose invite failures, so this
-   is the first thing to check if `/register` misbehaves.
+   Every workspace-identifying value (tokens, channel/user IDs) lives in `.env`,
+   never hardcoded in `main.py` — `.env` is git-ignored, so nothing workspace-specific
+   is ever committed. Leaving `OWNER_ID`/`TEAM_LEADER_IDS` unset causes confusing,
+   hard-to-diagnose invite failures (the bot logs a startup warning if either is
+   missing), so this is the first thing to check if `/register` misbehaves.
 4. Run with `python main.py` (or under PM2 for production — `pm2 start main.py
    --interpreter python3 --name taskbot`). It connects over Socket Mode, so no
    public URL or inbound webhook is needed.
@@ -276,8 +280,9 @@ TABLE` needed.
 - **Guest / Slack Connect accounts can't be invited** to a normal channel by
   the bot or manually — this needs a workspace admin to check the account type
   and convert it if appropriate. Not something the bot's scopes can fix.
-- **`TEAM_LEADER_IDS` / `OWNER_ID` left as placeholders** is a common cause of
-  invite failures that otherwise look unrelated — check these first.
+- **`TEAM_LEADER_IDS` / `OWNER_ID` unset in `.env`** is a common cause of
+  invite failures that otherwise look unrelated — check these first (the bot
+  logs a startup warning if either is missing).
 - **Deploying a new slash command isn't enough to make it exist.** The command
   also has to be created in the Slack app config, or Slack never routes it to
   the bot and users just see "command not found" against perfectly working
@@ -286,7 +291,7 @@ TABLE` needed.
 
 ## Open items
 
-- Fill in real values for `TEAM_LEADER_IDS` and `OWNER_ID`.
+- Fill in real values for `TEAM_LEADER_IDS` and `OWNER_ID` in `.env`.
 - Decide whether the weekly report should skip people with nothing in any of
   the three sections, instead of sending a mostly-empty report.
 - `REMINDER_CHANNEL_ID` is a leftover from before per-person channels existed;

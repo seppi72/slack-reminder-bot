@@ -17,23 +17,39 @@ from apscheduler.schedulers.background import BackgroundScheduler
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("task-bot")
 
+load_dotenv()
+
 # ---------------------------------------------------------------------------
 # config
+#
+# Every value here that identifies this workspace (channel/user IDs, tokens) lives in
+# .env, never in this file — .env is git-ignored, so nothing workspace-specific ends up
+# committed. main.py only holds the os.environ lookups; fill in the real values next to
+# main.py in .env (see .env.example).
 # ---------------------------------------------------------------------------
 
-REMINDER_CHANNEL_ID = "C0BJTQ09GFL"  # hardcoded channel ID — no longer used for reminders,
-                                     # kept around in case you want an admin/log channel later
+REMINDER_CHANNEL_ID = os.environ.get("REMINDER_CHANNEL_ID", "")  # hardcoded channel ID —
+                                     # no longer used for reminders, kept around in case
+                                     # you want an admin/log channel later
 DB_PATH = os.path.join(os.path.dirname(__file__), "tasks.db")
 
 # fixed team leaders who get added to every per-person registration channel.
-# fill these in with real Slack member IDs (find via user profile > "Copy member ID").
+# TEAM_LEADER_IDS in .env is a comma-separated list of Slack member IDs
+# (find via user profile > "Copy member ID"), e.g. TEAM_LEADER_IDS=U0B6L4YQ734,U09453J1QBW
 TEAM_LEADER_IDS = [
-    "U0B6L4YQ734",
-    "U09453J1QBW",
+    uid.strip() for uid in os.environ.get("TEAM_LEADER_IDS", "").split(",") if uid.strip()
 ]
 
 # always invited to every registration channel, regardless of who runs /register.
-OWNER_ID = "U0BHJRZCLUQ"
+OWNER_ID = os.environ.get("OWNER_ID", "")
+
+if not OWNER_ID or not TEAM_LEADER_IDS:
+    # Left unset, invites/registration will fail in ways that look unrelated to config
+    # (e.g. conversations.invite errors) — flag it here instead of leaving that a mystery.
+    logger.warning(
+        "OWNER_ID and/or TEAM_LEADER_IDS are not set in .env — /register invites will "
+        "be incomplete until they are."
+    )
 
 # set timezone to Eastern Time (handles EST/EDT automatically)
 EST_TZ = ZoneInfo("America/New_York")
@@ -41,8 +57,6 @@ EST_TZ = ZoneInfo("America/New_York")
 
 def now_est():
     return datetime.now(EST_TZ)
-
-load_dotenv()
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
